@@ -1,0 +1,4 @@
+[package]
+name = "jsync"
+version.workspace = true
+edition.workspace = true

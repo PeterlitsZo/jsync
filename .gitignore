@@ -1,0 +1,7 @@
+tmp/
+
+# Rust build artifacts
+jsync_rs/target/
+
+# JavaScript dependencies
+jsync_js/node_modules/
