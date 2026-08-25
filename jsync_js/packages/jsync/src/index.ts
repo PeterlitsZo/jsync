@@ -1,3 +1,4 @@
+export { Producer } from './producer.js';
 export { Consumer } from './consumer.js';
 export { JsyncError, JsyncErrorKind, ensureJsyncError } from './error.js';
 export type { JsyncErrorCode, JsyncErrorOptions } from './error.js';

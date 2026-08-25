@@ -1,0 +1,179 @@
+import { Encoder } from 'cbor-x';
+import { JsyncError, JsyncErrorKind } from './error.js';
+import {
+  ADD,
+  cloneJson,
+  JSYNC_HEADER,
+  normalizeJson,
+  REMOVE,
+  REPLACE,
+  SNAPSHOT,
+} from './value.js';
+import type { Action, JsonObject, JsonValue, PathSegment } from './value.js';
+
+const encoder = new Encoder({ mapsAsObjects: false, useRecords: false });
+
+/** Produces Jsync snapshots and incremental messages for a JSON document. */
+export class Producer {
+  #document: JsonValue;
+  #lastEmittedDocument: JsonValue | undefined;
+
+  /** Creates a producer with the initial JSON document. */
+  constructor(initialDocument: JsonValue) {
+    this.#document = normalizeJson(initialDocument);
+  }
+
+  /** Returns a deep copy of the current JSON document. */
+  get document(): JsonValue {
+    return cloneJson(this.#document) as JsonValue;
+  }
+
+  /** Replaces the current JSON document without producing a message yet. */
+  update(document: JsonValue): void {
+    this.#document = normalizeJson(document);
+  }
+
+  /** Produces the next Jsync message, or undefined when there is no change. */
+  getMessage(): Uint8Array | undefined {
+    let actions: Action[];
+    if (this.#lastEmittedDocument === undefined) {
+      actions = [{ type: SNAPSHOT, value: cloneJson(this.#document) as JsonValue }];
+    } else if (deepEqual(this.#lastEmittedDocument, this.#document)) {
+      return undefined;
+    } else {
+      actions = [];
+      buildDiff(this.#lastEmittedDocument, this.#document, [], actions);
+      if (actions.length === 0) {
+        throw new JsyncError(
+          JsyncErrorKind.ApplyFailed,
+          'The Jsync producer generated an empty diff for changed documents.',
+        );
+      }
+    }
+
+    const message = encodeMessage(actions);
+    this.#lastEmittedDocument = cloneJson(this.#document) as JsonValue;
+    return message;
+  }
+}
+
+function buildDiff(
+  from: JsonValue,
+  to: JsonValue,
+  path: PathSegment[],
+  actions: Action[],
+): void {
+  if (deepEqual(from, to)) return;
+
+  if (isObject(from) && isObject(to)) {
+    diffObjects(from, to, path, actions);
+    return;
+  }
+  if (Array.isArray(from) && Array.isArray(to)) {
+    diffArrays(from, to, path, actions);
+    return;
+  }
+  actions.push({ type: REPLACE, path: [...path], value: cloneJson(to) as JsonValue });
+}
+
+function diffObjects(
+  old: JsonObject,
+  next: JsonObject,
+  path: PathSegment[],
+  actions: Action[],
+): void {
+  const removed = Object.keys(old)
+    .filter((key) => !Object.hasOwn(next, key))
+    .sort();
+  for (const key of removed) {
+    actions.push({ type: REMOVE, path: [...path, key] });
+  }
+
+  const common = Object.keys(old)
+    .filter((key) => Object.hasOwn(next, key))
+    .sort();
+  for (const key of common) {
+    buildDiff(old[key], next[key], [...path, key], actions);
+  }
+
+  const added = Object.keys(next)
+    .filter((key) => !Object.hasOwn(old, key))
+    .sort();
+  for (const key of added) {
+    actions.push({
+      type: ADD,
+      path: [...path, key],
+      value: cloneJson(next[key]) as JsonValue,
+    });
+  }
+}
+
+function diffArrays(
+  old: JsonValue[],
+  next: JsonValue[],
+  path: PathSegment[],
+  actions: Action[],
+): void {
+  const commonLength = Math.min(old.length, next.length);
+  for (let index = 0; index < commonLength; index += 1) {
+    buildDiff(old[index], next[index], [...path, index], actions);
+  }
+
+  for (let index = old.length - 1; index >= next.length; index -= 1) {
+    actions.push({ type: REMOVE, path: [...path, index] });
+  }
+
+  for (let index = old.length; index < next.length; index += 1) {
+    actions.push({
+      type: ADD,
+      path: [...path, index],
+      value: cloneJson(next[index]) as JsonValue,
+    });
+  }
+}
+
+function encodeMessage(actions: Action[]): Uint8Array {
+  const payload = encoder.encode(actions.map(encodeAction));
+  const message = new Uint8Array(JSYNC_HEADER.length + payload.length);
+  message.set(JSYNC_HEADER);
+  message.set(payload, JSYNC_HEADER.length);
+  return message;
+}
+
+function encodeAction(action: Action): unknown[] {
+  if (action.type === SNAPSHOT) {
+    return [SNAPSHOT, cloneJson(action.value)];
+  }
+  if (action.type === ADD) {
+    return [ADD, [...action.path], cloneJson(action.value)];
+  }
+  if (action.type === REMOVE) {
+    return [REMOVE, [...action.path]];
+  }
+  return [REPLACE, [...action.path], cloneJson(action.value)];
+}
+
+function deepEqual(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== typeof right) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((value, index) => deepEqual(value, right[index]));
+  }
+  if (isObject(left) || isObject(right)) {
+    if (!isObject(left) || !isObject(right)) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every(
+      (key, index) => key === rightKeys[index] && deepEqual(left[key], right[key]),
+    );
+  }
+  return false;
+}
+
+function isObject(value: JsonValue): value is JsonObject {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}

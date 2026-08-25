@@ -142,7 +142,7 @@ function assertHeader(bytes: Uint8Array): void {
  * This helper deliberately does not add context. Its caller owns the semantic
  * location, such as the SNAPSHOT value or the ADD value.
  */
-function normalizeJson(value: unknown): JsonValue {
+export function normalizeJson(value: unknown): JsonValue {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return value;
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) {

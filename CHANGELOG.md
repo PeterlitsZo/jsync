@@ -2,4 +2,4 @@
 
 ## Unreleased
 
-- Support consuming jsync messages with Rust or JavaScript.
+- Support consuming and producing jsync messages with Rust or JavaScript.
