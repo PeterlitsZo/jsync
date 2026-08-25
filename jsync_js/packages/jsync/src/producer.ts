@@ -1,17 +1,8 @@
-import { Encoder } from 'cbor-x';
 import { JsyncError, JsyncErrorKind } from './error.js';
-import {
-  ADD,
-  cloneJson,
-  JSYNC_HEADER,
-  normalizeJson,
-  REMOVE,
-  REPLACE,
-  SNAPSHOT,
-} from './value.js';
-import type { Action, JsonObject, JsonValue, PathSegment } from './value.js';
-
-const encoder = new Encoder({ mapsAsObjects: false, useRecords: false });
+import { ADD, Message, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { cloneJson, normalizeJson } from './value.js';
+import type { Action, PathSegment } from './message.js';
+import type { JsonObject, JsonValue } from './value.js';
 
 /** Produces Jsync snapshots and incremental messages for a JSON document. */
 export class Producer {
@@ -51,7 +42,7 @@ export class Producer {
       }
     }
 
-    const message = encodeMessage(actions);
+    const message = new Message(actions).toBytes();
     this.#lastEmittedDocument = cloneJson(this.#document) as JsonValue;
     return message;
   }
@@ -130,27 +121,6 @@ function diffArrays(
       value: cloneJson(next[index]) as JsonValue,
     });
   }
-}
-
-function encodeMessage(actions: Action[]): Uint8Array {
-  const payload = encoder.encode(actions.map(encodeAction));
-  const message = new Uint8Array(JSYNC_HEADER.length + payload.length);
-  message.set(JSYNC_HEADER);
-  message.set(payload, JSYNC_HEADER.length);
-  return message;
-}
-
-function encodeAction(action: Action): unknown[] {
-  if (action.type === SNAPSHOT) {
-    return [SNAPSHOT, cloneJson(action.value)];
-  }
-  if (action.type === ADD) {
-    return [ADD, [...action.path], cloneJson(action.value)];
-  }
-  if (action.type === REMOVE) {
-    return [REMOVE, [...action.path]];
-  }
-  return [REPLACE, [...action.path], cloneJson(action.value)];
 }
 
 function deepEqual(left: JsonValue, right: JsonValue): boolean {

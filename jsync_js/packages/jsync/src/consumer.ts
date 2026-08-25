@@ -1,6 +1,8 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, cloneJson, decodeAndValidate, REMOVE, REPLACE, setOwn, SNAPSHOT } from './value.js';
-import type { Action, JsonObject, JsonValue, PathSegment } from './value.js';
+import { ADD, Message, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { cloneJson, setOwn } from './value.js';
+import type { Action, PathSegment } from './message.js';
+import type { JsonObject, JsonValue } from './value.js';
 
 /** Consumes Jsync messages and maintains the current JSON document. */
 export class Consumer {
@@ -16,7 +18,7 @@ export class Consumer {
   consume(message: Uint8Array | ArrayBuffer): this {
     let actions: Action[];
     try {
-      actions = decodeAndValidate(message);
+      actions = Message.fromBytes(message).actions;
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while consuming a Jsync message');
     }

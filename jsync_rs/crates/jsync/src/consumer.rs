@@ -1,12 +1,7 @@
-use std::io::Cursor;
-
-use ciborium::Value as CborValue;
 use serde_json::Value;
 
 use crate::error::{JsyncError, JsyncErrorKind};
-use crate::value::{Action, PathSegment, parse_actions};
-
-const HEADER: [u8; 3] = [0xd9, 0xff, 0x01];
+use crate::message::{Action, Message, PathSegment};
 
 /// Consumes Jsync messages and maintains the current JSON document.
 #[derive(Debug, Default)]
@@ -28,7 +23,7 @@ impl Consumer {
 
     /// Decodes and atomically applies one Jsync message.
     pub fn consume(&mut self, message: &[u8]) -> Result<(), JsyncError> {
-        let actions = parse_actions(decode_payload(message)?)?;
+        let actions = Message::from_bytes(message.to_vec())?.actions;
         if !self.initialized && !matches!(actions.first(), Some(Action::Snapshot { .. })) {
             return Err(JsyncError::new(
                 JsyncErrorKind::InitialSnapshotRequired,
@@ -49,46 +44,6 @@ impl Consumer {
         self.initialized = true;
         Ok(())
     }
-}
-
-/// Decodes the one CBOR payload after validating and removing the Jsync header.
-fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
-    if message.get(..HEADER.len()) != Some(HEADER.as_slice()) {
-        if message.len() >= 3 && message[0..2] == [0xd9, 0xff] && message[2] > 1 {
-            return Err(JsyncError::new(
-                JsyncErrorKind::UnsupportedVersion,
-                "The Jsync version is unsupported.",
-            )
-            .with_metadata("version", message[2].to_string())
-            .with_metadata("expected", "1"));
-        }
-        return Err(JsyncError::new(
-            JsyncErrorKind::InvalidHeader,
-            "The message is not a valid Jsync message or its version is newer.",
-        )
-        .with_metadata("expected", "0xd9ff01"));
-    }
-
-    let payload = &message[HEADER.len()..];
-    let mut cursor = Cursor::new(payload);
-    let value = ciborium::de::from_reader::<CborValue, _>(&mut cursor).map_err(|error| {
-        JsyncError::new(
-            JsyncErrorKind::CborDecode,
-            "The Jsync payload could not be decoded as CBOR.",
-        )
-        .with_source(anyhow::Error::new(error))
-    })?;
-    if cursor.position() != payload.len() as u64 {
-        return Err(JsyncError::new(
-            JsyncErrorKind::TrailingBytes,
-            "The Jsync payload contains trailing bytes.",
-        )
-        .with_metadata(
-            "remaining",
-            (payload.len() as u64 - cursor.position()).to_string(),
-        ));
-    }
-    Ok(value)
 }
 
 /// Applies one validated action to a working document.

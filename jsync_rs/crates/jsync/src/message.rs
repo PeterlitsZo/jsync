@@ -1,20 +1,22 @@
+use std::io::Cursor;
+
 use ciborium::Value as CborValue;
 use serde_json::{Map, Number, Value};
 
 use crate::error::{JsyncError, JsyncErrorKind};
 
-/// Represents one segment in an already validated action path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathSegment {
-    /// Selects an object property by key.
-    Key(String),
-    /// Selects an array element by non-negative index.
-    Index(usize),
+const HEADER: [u8; 3] = [0xd9, 0xff, 0x01];
+
+/// A structured Jsync message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    /// Ordered actions contained in the message.
+    pub actions: Vec<Action>,
 }
 
-/// Represents one validated action ready to be applied.
+/// A structured Jsync action.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Action {
+pub enum Action {
     /// Replaces the current document with the given JSON value.
     Snapshot {
         /// The snapshot value to replace the current document with.
@@ -41,8 +43,91 @@ pub(crate) enum Action {
     },
 }
 
-/// Validates and converts a decoded CBOR message into executable actions.
-pub(crate) fn parse_actions(value: CborValue) -> Result<Vec<Action>, JsyncError> {
+/// One segment in a validated Jsync action path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSegment {
+    /// Selects an object property by key.
+    Key(String),
+    /// Selects an array element by non-negative index.
+    Index(usize),
+}
+
+impl Message {
+    /// Creates a message from already structured actions.
+    pub fn new(actions: Vec<Action>) -> Self {
+        Self { actions }
+    }
+
+    /// Decodes and validates one complete Jsync binary message.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, JsyncError> {
+        let payload = decode_payload(&bytes)?;
+        Ok(Self {
+            actions: parse_actions(payload)?,
+        })
+    }
+
+    /// Encodes this message as Jsync version 1 bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, JsyncError> {
+        let payload = CborValue::Array(
+            self.actions
+                .iter()
+                .map(action_to_cbor)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let mut bytes = HEADER.to_vec();
+        ciborium::ser::into_writer(&payload, &mut bytes).map_err(|error| {
+            JsyncError::new(
+                JsyncErrorKind::ApplyFailed,
+                "The Jsync message could not be encoded.",
+            )
+            .with_source(anyhow::Error::new(error))
+        })?;
+        Ok(bytes)
+    }
+}
+
+/// Decodes the one CBOR payload after validating and removing the Jsync header.
+fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
+    if message.get(..HEADER.len()) != Some(HEADER.as_slice()) {
+        if message.len() >= 3 && message[0..2] == [0xd9, 0xff] && message[2] > 1 {
+            return Err(JsyncError::new(
+                JsyncErrorKind::UnsupportedVersion,
+                "The Jsync version is unsupported.",
+            )
+            .with_metadata("version", message[2].to_string())
+            .with_metadata("expected", "1"));
+        }
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidHeader,
+            "The message is not a valid Jsync message or its version is newer.",
+        )
+        .with_metadata("expected", "0xd9ff01"));
+    }
+
+    let payload = &message[HEADER.len()..];
+    let mut cursor = Cursor::new(payload);
+    let value = ciborium::de::from_reader::<CborValue, _>(&mut cursor).map_err(|error| {
+        JsyncError::new(
+            JsyncErrorKind::CborDecode,
+            "The Jsync payload could not be decoded as CBOR.",
+        )
+        .with_source(anyhow::Error::new(error))
+    })?;
+    if cursor.position() != payload.len() as u64 {
+        return Err(JsyncError::new(
+            JsyncErrorKind::TrailingBytes,
+            "The Jsync payload contains trailing bytes.",
+        )
+        .with_metadata(
+            "remaining",
+            (payload.len() as u64 - cursor.position()).to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Validates and converts a decoded CBOR message into structured actions.
+fn parse_actions(value: CborValue) -> Result<Vec<Action>, JsyncError> {
     let actions = match value {
         CborValue::Array(actions) => actions,
         _ => {
@@ -203,7 +288,34 @@ fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
         .collect()
 }
 
-/// Converts a raw CBOR value into the supported JSON data model.
+fn action_to_cbor(action: &Action) -> Result<CborValue, JsyncError> {
+    match action {
+        Action::Snapshot { value } => Ok(CborValue::Array(vec![integer(0), json_to_cbor(value)?])),
+        Action::Add { path, value } => Ok(CborValue::Array(vec![
+            integer(1),
+            path_to_cbor(path),
+            json_to_cbor(value)?,
+        ])),
+        Action::Remove { path } => Ok(CborValue::Array(vec![integer(2), path_to_cbor(path)])),
+        Action::Replace { path, value } => Ok(CborValue::Array(vec![
+            integer(3),
+            path_to_cbor(path),
+            json_to_cbor(value)?,
+        ])),
+    }
+}
+
+fn path_to_cbor(path: &[PathSegment]) -> CborValue {
+    CborValue::Array(
+        path.iter()
+            .map(|segment| match segment {
+                PathSegment::Key(key) => CborValue::Text(key.clone()),
+                PathSegment::Index(index) => integer(*index as u64),
+            })
+            .collect(),
+    )
+}
+
 fn to_json(value: CborValue) -> Result<Value, JsyncError> {
     match value {
         CborValue::Null => Ok(Value::Null),
@@ -262,4 +374,57 @@ fn to_json(value: CborValue) -> Result<Value, JsyncError> {
             "This CBOR value type is not allowed in JSON.",
         )),
     }
+}
+
+fn json_to_cbor(value: &Value) -> Result<CborValue, JsyncError> {
+    match value {
+        Value::Null => Ok(CborValue::Null),
+        Value::Bool(value) => Ok(CborValue::Bool(*value)),
+        Value::Number(number) => number_to_cbor(number),
+        Value::String(value) => Ok(CborValue::Text(value.clone())),
+        Value::Array(values) => Ok(CborValue::Array(
+            values
+                .iter()
+                .map(json_to_cbor)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Value::Object(object) => Ok(CborValue::Map(
+            object
+                .iter()
+                .map(|(key, value)| Ok((CborValue::Text(key.clone()), json_to_cbor(value)?)))
+                .collect::<Result<Vec<_>, JsyncError>>()?,
+        )),
+    }
+}
+
+fn number_to_cbor(number: &Number) -> Result<CborValue, JsyncError> {
+    if let Some(value) = number.as_i64() {
+        return Ok(integer(value));
+    }
+    if let Some(value) = number.as_u64() {
+        return Ok(integer(value));
+    }
+
+    let text = number.to_string();
+    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The JSON integer is outside the supported CBOR integer range.",
+        ));
+    }
+    if let Some(value) = number.as_f64() {
+        return Ok(CborValue::Float(value));
+    }
+
+    Err(JsyncError::new(
+        JsyncErrorKind::InvalidJsonValue,
+        "The JSON number cannot be encoded as a CBOR number.",
+    ))
+}
+
+fn integer<T>(value: T) -> CborValue
+where
+    ciborium::value::Integer: From<T>,
+{
+    CborValue::Integer(value.into())
 }
