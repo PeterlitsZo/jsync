@@ -1,1 +1,0 @@
-// Jsync JavaScript implementation.

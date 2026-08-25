@@ -2,3 +2,8 @@
 name = "jsync"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+ciborium = "0.2.2"
+serde_json = { version = "1", features = ["arbitrary_precision"] }

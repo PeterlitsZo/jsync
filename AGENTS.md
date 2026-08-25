@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## What is this?
+
+Jsync, is a project that help us synchronize JSON documents between client and
+server. It supports multipie languages:
+
+- `jsync_rs`: Support Rust.
+- `jsonc_js`: Support JavaScript.
+
 ## When You Need to Commit
 
 WHEN THE USER ASKS YOU TO COMMIT, you MUST follow this section.
