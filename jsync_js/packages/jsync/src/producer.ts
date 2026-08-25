@@ -32,8 +32,7 @@ export class Producer {
     } else if (deepEqual(this.#lastEmittedDocument, this.#document)) {
       return undefined;
     } else {
-      actions = [];
-      buildDiff(this.#lastEmittedDocument, this.#document, [], actions);
+      actions = buildDiff(this.#lastEmittedDocument, this.#document, []).actions;
       if (actions.length === 0) {
         throw new JsyncError(
           JsyncErrorKind.ApplyFailed,
@@ -48,31 +47,36 @@ export class Producer {
   }
 }
 
+interface DiffPlan {
+  readonly actions: Action[];
+  readonly cost: number;
+}
+
 function buildDiff(
   from: JsonValue,
   to: JsonValue,
   path: PathSegment[],
-  actions: Action[],
-): void {
-  if (deepEqual(from, to)) return;
+): DiffPlan {
+  if (deepEqual(from, to)) return plan([]);
+
+  const replace = replacePlan(path, to);
 
   if (isObject(from) && isObject(to)) {
-    diffObjects(from, to, path, actions);
-    return;
+    return chooseSmaller(diffObjects(from, to, path), replace);
   }
   if (Array.isArray(from) && Array.isArray(to)) {
-    diffArrays(from, to, path, actions);
-    return;
+    return chooseSmaller(diffArrays(from, to, path), replace);
   }
-  actions.push({ type: REPLACE, path: [...path], value: cloneJson(to) as JsonValue });
+  return replace;
 }
 
 function diffObjects(
   old: JsonObject,
   next: JsonObject,
   path: PathSegment[],
-  actions: Action[],
-): void {
+): DiffPlan {
+  const actions: Action[] = [];
+
   const removed = Object.keys(old)
     .filter((key) => !Object.hasOwn(next, key))
     .sort();
@@ -84,7 +88,7 @@ function diffObjects(
     .filter((key) => Object.hasOwn(next, key))
     .sort();
   for (const key of common) {
-    buildDiff(old[key], next[key], [...path, key], actions);
+    actions.push(...buildDiff(old[key], next[key], [...path, key]).actions);
   }
 
   const added = Object.keys(next)
@@ -97,17 +101,20 @@ function diffObjects(
       value: cloneJson(next[key]) as JsonValue,
     });
   }
+
+  return plan(actions);
 }
 
 function diffArrays(
   old: JsonValue[],
   next: JsonValue[],
   path: PathSegment[],
-  actions: Action[],
-): void {
+): DiffPlan {
+  const actions: Action[] = [];
+
   const commonLength = Math.min(old.length, next.length);
   for (let index = 0; index < commonLength; index += 1) {
-    buildDiff(old[index], next[index], [...path, index], actions);
+    actions.push(...buildDiff(old[index], next[index], [...path, index]).actions);
   }
 
   for (let index = old.length - 1; index >= next.length; index -= 1) {
@@ -121,6 +128,23 @@ function diffArrays(
       value: cloneJson(next[index]) as JsonValue,
     });
   }
+
+  return plan(actions);
+}
+
+function replacePlan(path: PathSegment[], value: JsonValue): DiffPlan {
+  return plan([{ type: REPLACE, path: [...path], value: cloneJson(value) as JsonValue }]);
+}
+
+function plan(actions: Action[]): DiffPlan {
+  return {
+    actions,
+    cost: actions.length === 0 ? 0 : new Message(actions).toBytes().length,
+  };
+}
+
+function chooseSmaller(structural: DiffPlan, replace: DiffPlan): DiffPlan {
+  return replace.cost < structural.cost ? replace : structural;
 }
 
 function deepEqual(left: JsonValue, right: JsonValue): boolean {

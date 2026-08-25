@@ -81,14 +81,8 @@ fn producer_messages_keep_consumer_in_sync() {
             }),
             expected_message: Message::new(vec![
                 Action::Replace {
-                    path: vec![PathSegment::Key("items".to_string()), PathSegment::Index(0)],
-                    value: json!("gamma"),
-                },
-                Action::Remove {
-                    path: vec![PathSegment::Key("items".to_string()), PathSegment::Index(2)],
-                },
-                Action::Remove {
-                    path: vec![PathSegment::Key("items".to_string()), PathSegment::Index(1)],
+                    path: vec![PathSegment::Key("items".to_string())],
+                    value: json!(["gamma"]),
                 },
                 Action::Replace {
                     path: vec![PathSegment::Key("revision".to_string())],
@@ -98,7 +92,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     path: vec![PathSegment::Key("tags".to_string()), PathSegment::Index(1)],
                 },
             ]),
-            expected_message_bytes_len: 62,
+            expected_message_bytes_len: 42,
         },
         UpdateCase {
             to_update: json!(["root replacement", {"revision": 4}, [1, 2, 3]]),
@@ -166,4 +160,34 @@ fn producer_messages_keep_consumer_in_sync() {
     }
 
     assert_eq!(consumer.document(), Some(producer.document()));
+}
+
+#[test]
+fn producer_replaces_object_subtree_when_it_is_smaller() {
+    let initial = json!({
+        "wrapper": {"a": 0, "b": 0, "c": 0, "d": 0, "e": 0},
+        "unchanged": true,
+    });
+    let mut producer = Producer::new(initial);
+    producer
+        .get_message()
+        .expect("initial message should be encoded")
+        .expect("initial snapshot should exist");
+
+    producer.update(json!({
+        "wrapper": {"a": 1, "b": 1, "c": 1, "d": 1, "e": 1},
+        "unchanged": true,
+    }));
+    let message = producer
+        .get_message()
+        .expect("producer message should be encoded")
+        .expect("must have message to sync");
+
+    assert_eq!(
+        Message::from_bytes(message).expect("producer message should decode"),
+        Message::new(vec![Action::Replace {
+            path: vec![PathSegment::Key("wrapper".to_string())],
+            value: json!({"a": 1, "b": 1, "c": 1, "d": 1, "e": 1}),
+        }])
+    );
 }

@@ -42,9 +42,8 @@ impl Producer {
             }],
             Some(previous) if previous == &self.current_document => return Ok(None),
             Some(previous) => {
-                let mut actions = Vec::new();
                 let mut path = Vec::new();
-                build_diff(previous, &self.current_document, &mut path, &mut actions);
+                let actions = build_diff(previous, &self.current_document, &mut path)?.actions;
                 if actions.is_empty() {
                     return Err(JsyncError::new(
                         JsyncErrorKind::ApplyFailed,
@@ -61,27 +60,41 @@ impl Producer {
     }
 }
 
-fn build_diff(from: &Value, to: &Value, path: &mut Vec<PathSegment>, actions: &mut Vec<Action>) {
+#[derive(Debug)]
+struct DiffPlan {
+    actions: Vec<Action>,
+    cost: usize,
+}
+
+fn build_diff(
+    from: &Value,
+    to: &Value,
+    path: &mut Vec<PathSegment>,
+) -> Result<DiffPlan, JsyncError> {
     if from == to {
-        return;
+        return Ok(DiffPlan {
+            actions: Vec::new(),
+            cost: 0,
+        });
     }
 
-    match (from, to) {
-        (Value::Object(old), Value::Object(new)) => diff_objects(old, new, path, actions),
-        (Value::Array(old), Value::Array(new)) => diff_arrays(old, new, path, actions),
-        _ => actions.push(Action::Replace {
-            path: path.clone(),
-            value: to.clone(),
-        }),
-    }
+    let replace = replace_plan(path, to)?;
+    let structural = match (from, to) {
+        (Value::Object(old), Value::Object(new)) => diff_objects(old, new, path),
+        (Value::Array(old), Value::Array(new)) => diff_arrays(old, new, path),
+        _ => return Ok(replace),
+    }?;
+
+    Ok(choose_smaller(structural, replace))
 }
 
 fn diff_objects(
     old: &Map<String, Value>,
     new: &Map<String, Value>,
     path: &mut Vec<PathSegment>,
-    actions: &mut Vec<Action>,
-) {
+) -> Result<DiffPlan, JsyncError> {
+    let mut actions = Vec::new();
+
     let mut removed = old
         .keys()
         .filter(|key| !new.contains_key(*key))
@@ -100,7 +113,7 @@ fn diff_objects(
     common.sort();
     for key in common {
         path.push(PathSegment::Key(key.clone()));
-        build_diff(&old[key], &new[key], path, actions);
+        actions.extend(build_diff(&old[key], &new[key], path)?.actions);
         path.pop();
     }
 
@@ -117,17 +130,20 @@ fn diff_objects(
             value: new[key].clone(),
         });
     }
+
+    Ok(plan(actions)?)
 }
 
 fn diff_arrays(
     old: &[Value],
     new: &[Value],
     path: &mut Vec<PathSegment>,
-    actions: &mut Vec<Action>,
-) {
+) -> Result<DiffPlan, JsyncError> {
+    let mut actions = Vec::new();
+
     for index in 0..old.len().min(new.len()) {
         path.push(PathSegment::Index(index));
-        build_diff(&old[index], &new[index], path, actions);
+        actions.extend(build_diff(&old[index], &new[index], path)?.actions);
         path.pop();
     }
 
@@ -144,5 +160,31 @@ fn diff_arrays(
             path: target,
             value: value.clone(),
         });
+    }
+
+    Ok(plan(actions)?)
+}
+
+fn replace_plan(path: &[PathSegment], value: &Value) -> Result<DiffPlan, JsyncError> {
+    plan(vec![Action::Replace {
+        path: path.to_vec(),
+        value: value.clone(),
+    }])
+}
+
+fn plan(actions: Vec<Action>) -> Result<DiffPlan, JsyncError> {
+    let cost = if actions.is_empty() {
+        0
+    } else {
+        Message::new(actions.clone()).to_bytes()?.len()
+    };
+    Ok(DiffPlan { actions, cost })
+}
+
+fn choose_smaller(structural: DiffPlan, replace: DiffPlan) -> DiffPlan {
+    if replace.cost < structural.cost {
+        replace
+    } else {
+        structural
     }
 }

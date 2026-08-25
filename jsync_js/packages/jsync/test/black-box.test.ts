@@ -55,9 +55,7 @@ test('producer messages keep consumer in sync', () => {
         tags: ['math'],
       },
       new Message([
-        { type: REPLACE, path: ['items', 0], value: 'gamma' },
-        { type: REMOVE, path: ['items', 2] },
-        { type: REMOVE, path: ['items', 1] },
+        { type: REPLACE, path: ['items'], value: ['gamma'] },
         { type: REPLACE, path: ['revision'], value: 3 },
         { type: REMOVE, path: ['tags', 1] },
       ]),
@@ -111,4 +109,24 @@ test('producer messages keep consumer in sync', () => {
   }
 
   assert.deepEqual(consumer.document, producer.document);
+});
+
+test('producer replaces object subtree when it is smaller', () => {
+  const producer = new Producer({
+    wrapper: { a: 0, b: 0, c: 0, d: 0, e: 0 },
+    unchanged: true,
+  });
+  assert.ok(producer.getMessage());
+
+  producer.update({
+    wrapper: { a: 1, b: 1, c: 1, d: 1, e: 1 },
+    unchanged: true,
+  });
+  const message = producer.getMessage();
+  assert.ok(message);
+
+  assert.deepEqual(
+    Message.fromBytes(message),
+    new Message([{ type: REPLACE, path: ['wrapper'], value: { a: 1, b: 1, c: 1, d: 1, e: 1 } }]),
+  );
 });
