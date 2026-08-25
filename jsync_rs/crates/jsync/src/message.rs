@@ -41,6 +41,20 @@ pub enum Action {
         /// The replacement JSON value.
         value: Value,
     },
+    /// Appends text to an existing string value at the given path.
+    Append {
+        /// The validated path of the string to append to.
+        path: Vec<PathSegment>,
+        /// The text to append.
+        text: String,
+    },
+    /// Prepends text to an existing string value at the given path.
+    Prepend {
+        /// The validated path of the string to prepend to.
+        path: Vec<PathSegment>,
+        /// The text to prepend.
+        text: String,
+    },
 }
 
 /// One segment in a validated Jsync action path.
@@ -223,6 +237,26 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
                 .map_err(|error| error.with_context("while decoding the REPLACE value"))?;
             Ok(Action::Replace { path, value })
         }
+        4 => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let path = parse_path(elements.next().expect("validated append length"))
+                .map_err(|error| error.with_context("while parsing the APPEND path"))?;
+            let text = parse_text(elements.next().expect("validated append length"))
+                .map_err(|error| error.with_context("while decoding the APPEND text"))?;
+            Ok(Action::Append { path, text })
+        }
+        5 => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let path = parse_path(elements.next().expect("validated prepend length"))
+                .map_err(|error| error.with_context("while parsing the PREPEND path"))?;
+            let text = parse_text(elements.next().expect("validated prepend length"))
+                .map_err(|error| error.with_context("while decoding the PREPEND text"))?;
+            Ok(Action::Prepend { path, text })
+        }
         opcode => Err(JsyncError::new(
             JsyncErrorKind::UnknownAction,
             "The Jsync action opcode is not supported.",
@@ -302,6 +336,16 @@ fn action_to_cbor(action: &Action) -> Result<CborValue, JsyncError> {
             path_to_cbor(path),
             json_to_cbor(value)?,
         ])),
+        Action::Append { path, text } => Ok(CborValue::Array(vec![
+            integer(4),
+            path_to_cbor(path),
+            CborValue::Text(text.clone()),
+        ])),
+        Action::Prepend { path, text } => Ok(CborValue::Array(vec![
+            integer(5),
+            path_to_cbor(path),
+            CborValue::Text(text.clone()),
+        ])),
     }
 }
 
@@ -314,6 +358,16 @@ fn path_to_cbor(path: &[PathSegment]) -> CborValue {
             })
             .collect(),
     )
+}
+
+fn parse_text(value: CborValue) -> Result<String, JsyncError> {
+    match value {
+        CborValue::Text(text) => Ok(text),
+        _ => Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The string patch text must be a CBOR text string.",
+        )),
+    }
 }
 
 fn to_json(value: CborValue) -> Result<Value, JsyncError> {

@@ -29,24 +29,24 @@ fn producer_messages_keep_consumer_in_sync() {
                     path: vec![PathSegment::Key("items".to_string()), PathSegment::Index(2)],
                     value: json!("gamma"),
                 },
-                Action::Replace {
+                Action::Append {
                     path: vec![
                         PathSegment::Key("profile".to_string()),
                         PathSegment::Key("name".to_string()),
                     ],
-                    value: json!("Ada Lovelace"),
+                    text: " Lovelace".to_string(),
                 },
                 Action::Replace {
                     path: vec![PathSegment::Key("revision".to_string())],
                     value: json!(1),
                 },
             ]),
-            expected_message_bytes_len: 62,
+            expected_message_bytes_len: 59,
         },
         UpdateCase {
             to_update: json!({
                 "revision": 2,
-                "profile": {"name": "Ada Lovelace", "active": false},
+                "profile": {"name": "Countess Ada Lovelace", "active": false},
                 "items": ["alpha", "beta", "gamma"],
                 "tags": ["math", "programming"],
             }),
@@ -61,6 +61,13 @@ fn producer_messages_keep_consumer_in_sync() {
                     ],
                     value: json!(false),
                 },
+                Action::Prepend {
+                    path: vec![
+                        PathSegment::Key("profile".to_string()),
+                        PathSegment::Key("name".to_string()),
+                    ],
+                    text: "Countess ".to_string(),
+                },
                 Action::Replace {
                     path: vec![PathSegment::Key("revision".to_string())],
                     value: json!(2),
@@ -70,12 +77,12 @@ fn producer_messages_keep_consumer_in_sync() {
                     value: json!(["math", "programming"]),
                 },
             ]),
-            expected_message_bytes_len: 74,
+            expected_message_bytes_len: 100,
         },
         UpdateCase {
             to_update: json!({
                 "revision": 3,
-                "profile": {"name": "Ada Lovelace", "active": false},
+                "profile": {"name": "Countess Ada Lovelace", "active": false},
                 "items": ["gamma"],
                 "tags": ["math"],
             }),

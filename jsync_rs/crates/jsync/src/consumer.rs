@@ -56,6 +56,8 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
         Action::Add { path, value } => apply_add(root, &path, value),
         Action::Remove { path } => apply_remove(root, &path),
         Action::Replace { path, value } => apply_replace(root, &path, value),
+        Action::Append { path, text } => apply_append(root, &path, &text),
+        Action::Prepend { path, text } => apply_prepend(root, &path, &text),
     }
 }
 
@@ -246,6 +248,36 @@ fn apply_replace(root: &mut Value, path: &[PathSegment], value: Value) -> Result
     }
 }
 
+/// Appends text to an existing string at an object, array, or root path.
+fn apply_append(root: &mut Value, path: &[PathSegment], text: &str) -> Result<(), JsyncError> {
+    let target = resolve_value(root, path)
+        .map_err(|error| error.with_context("while resolving an APPEND path target"))?;
+    let Value::String(target) = target else {
+        return Err(JsyncError::new(
+            JsyncErrorKind::ApplyFailed,
+            "The APPEND path target is not a string.",
+        )
+        .with_context("while applying the APPEND action"));
+    };
+    target.push_str(text);
+    Ok(())
+}
+
+/// Prepends text to an existing string at an object, array, or root path.
+fn apply_prepend(root: &mut Value, path: &[PathSegment], text: &str) -> Result<(), JsyncError> {
+    let target = resolve_value(root, path)
+        .map_err(|error| error.with_context("while resolving a PREPEND path target"))?;
+    let Value::String(target) = target else {
+        return Err(JsyncError::new(
+            JsyncErrorKind::ApplyFailed,
+            "The PREPEND path target is not a string.",
+        )
+        .with_context("while applying the PREPEND action"));
+    };
+    target.insert_str(0, text);
+    Ok(())
+}
+
 /// Resolves an existing object or array container for an action parent path.
 fn resolve_container<'a>(
     mut current: &'a mut Value,
@@ -302,6 +334,68 @@ fn resolve_container<'a>(
                 )
                 .with_metadata("segment_index", segment_index.to_string())
                 .with_context("while resolving a path parent"));
+            }
+        };
+    }
+    Ok(current)
+}
+
+/// Resolves an existing value for an action path.
+fn resolve_value<'a>(
+    mut current: &'a mut Value,
+    path: &[PathSegment],
+) -> Result<&'a mut Value, JsyncError> {
+    for (segment_index, segment) in path.iter().enumerate() {
+        current = match (current, segment) {
+            (Value::Object(object), PathSegment::Key(key)) => {
+                object.get_mut(key).ok_or_else(|| {
+                    JsyncError::new(
+                        JsyncErrorKind::PathParentMissing,
+                        "The path object key does not exist.",
+                    )
+                    .with_metadata("key", key.clone())
+                    .with_metadata("segment_index", segment_index.to_string())
+                    .with_context("while resolving a path target")
+                })?
+            }
+            (Value::Array(array), PathSegment::Index(index)) => {
+                let length = array.len();
+                array.get_mut(*index).ok_or_else(|| {
+                    JsyncError::new(
+                        JsyncErrorKind::ArrayIndexOutOfBounds,
+                        "The path index is outside the array.",
+                    )
+                    .with_metadata("index", index.to_string())
+                    .with_metadata("length", length.to_string())
+                    .with_metadata("segment_index", segment_index.to_string())
+                    .with_context("while resolving a path target")
+                })?
+            }
+            (Value::Array(_), PathSegment::Key(key)) => {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "An array path segment must be an index.",
+                )
+                .with_metadata("segment", key.clone())
+                .with_metadata("segment_index", segment_index.to_string())
+                .with_context("while resolving a path target"));
+            }
+            (Value::Object(_), PathSegment::Index(index)) => {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "An object path segment must be a string.",
+                )
+                .with_metadata("index", index.to_string())
+                .with_metadata("segment_index", segment_index.to_string())
+                .with_context("while resolving a path target"));
+            }
+            (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_), _) => {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::PathParentNotContainer,
+                    "The path traversed a scalar.",
+                )
+                .with_metadata("segment_index", segment_index.to_string())
+                .with_context("while resolving a path target"));
             }
         };
     }

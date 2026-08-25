@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   ADD,
+  APPEND,
   Consumer,
   Message,
+  PREPEND,
   Producer,
   REMOVE,
   REPLACE,
@@ -29,20 +31,21 @@ test('producer messages keep consumer in sync', () => {
       },
       new Message([
         { type: ADD, path: ['items', 2], value: 'gamma' },
-        { type: REPLACE, path: ['profile', 'name'], value: 'Ada Lovelace' },
+        { type: APPEND, path: ['profile', 'name'], text: ' Lovelace' },
         { type: REPLACE, path: ['revision'], value: 1 },
       ]),
     ],
     [
       {
         revision: 2,
-        profile: { name: 'Ada Lovelace', active: false },
+        profile: { name: 'Countess Ada Lovelace', active: false },
         items: ['alpha', 'beta', 'gamma'],
         tags: ['math', 'programming'],
       },
       new Message([
         { type: REMOVE, path: ['obsolete'] },
         { type: REPLACE, path: ['profile', 'active'], value: false },
+        { type: PREPEND, path: ['profile', 'name'], text: 'Countess ' },
         { type: REPLACE, path: ['revision'], value: 2 },
         { type: ADD, path: ['tags'], value: ['math', 'programming'] },
       ]),
@@ -50,7 +53,7 @@ test('producer messages keep consumer in sync', () => {
     [
       {
         revision: 3,
-        profile: { name: 'Ada Lovelace', active: false },
+        profile: { name: 'Countess Ada Lovelace', active: false },
         items: ['gamma'],
         tags: ['math'],
       },

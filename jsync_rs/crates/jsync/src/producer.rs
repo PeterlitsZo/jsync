@@ -82,6 +82,7 @@ fn build_diff(
     let structural = match (from, to) {
         (Value::Object(old), Value::Object(new)) => diff_objects(old, new, path),
         (Value::Array(old), Value::Array(new)) => diff_arrays(old, new, path),
+        (Value::String(old), Value::String(new)) => return diff_strings(old, new, path, replace),
         _ => return Ok(replace),
     }?;
 
@@ -163,6 +164,41 @@ fn diff_arrays(
     }
 
     Ok(plan(actions)?)
+}
+
+fn diff_strings(
+    old: &str,
+    new: &str,
+    path: &[PathSegment],
+    replace: DiffPlan,
+) -> Result<DiffPlan, JsyncError> {
+    let mut best = replace;
+
+    if let Some(suffix) = new.strip_prefix(old) {
+        if !suffix.is_empty() {
+            let append = plan(vec![Action::Append {
+                path: path.to_vec(),
+                text: suffix.to_string(),
+            }])?;
+            if append.cost < best.cost {
+                best = append;
+            }
+        }
+    }
+
+    if let Some(prefix) = new.strip_suffix(old) {
+        if !prefix.is_empty() {
+            let prepend = plan(vec![Action::Prepend {
+                path: path.to_vec(),
+                text: prefix.to_string(),
+            }])?;
+            if prepend.cost < best.cost {
+                best = prepend;
+            }
+        }
+    }
+
+    Ok(best)
 }
 
 fn replace_plan(path: &[PathSegment], value: &Value) -> Result<DiffPlan, JsyncError> {

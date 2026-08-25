@@ -1,5 +1,5 @@
 import { JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, Message, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { ADD, APPEND, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
 import { cloneJson, normalizeJson } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -67,6 +67,9 @@ function buildDiff(
   if (Array.isArray(from) && Array.isArray(to)) {
     return chooseSmaller(diffArrays(from, to, path), replace);
   }
+  if (typeof from === 'string' && typeof to === 'string') {
+    return diffStrings(from, to, path, replace);
+  }
   return replace;
 }
 
@@ -130,6 +133,33 @@ function diffArrays(
   }
 
   return plan(actions);
+}
+
+function diffStrings(
+  old: string,
+  next: string,
+  path: PathSegment[],
+  replace: DiffPlan,
+): DiffPlan {
+  let best = replace;
+
+  if (next.startsWith(old)) {
+    const suffix = next.slice(old.length);
+    if (suffix.length > 0) {
+      const append = plan([{ type: APPEND, path: [...path], text: suffix }]);
+      if (append.cost < best.cost) best = append;
+    }
+  }
+
+  if (next.endsWith(old)) {
+    const prefix = next.slice(0, next.length - old.length);
+    if (prefix.length > 0) {
+      const prepend = plan([{ type: PREPEND, path: [...path], text: prefix }]);
+      if (prepend.cost < best.cost) best = prepend;
+    }
+  }
+
+  return best;
 }
 
 function replacePlan(path: PathSegment[], value: JsonValue): DiffPlan {

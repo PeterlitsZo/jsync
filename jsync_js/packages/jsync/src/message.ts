@@ -13,6 +13,10 @@ export const ADD = 1;
 export const REMOVE = 2;
 /** The REPLACE action opcode. */
 export const REPLACE = 3;
+/** The APPEND action opcode. */
+export const APPEND = 4;
+/** The PREPEND action opcode. */
+export const PREPEND = 5;
 
 /** A validated action path segment. */
 export type PathSegment = string | number;
@@ -43,8 +47,28 @@ export interface ReplaceAction {
   readonly value: JsonValue;
 }
 
+/** A validated APPEND action. */
+export interface AppendAction {
+  readonly type: typeof APPEND;
+  readonly path: PathSegment[];
+  readonly text: string;
+}
+
+/** A validated PREPEND action. */
+export interface PrependAction {
+  readonly type: typeof PREPEND;
+  readonly path: PathSegment[];
+  readonly text: string;
+}
+
 /** A validated Jsync action. */
-export type Action = SnapshotAction | AddAction | RemoveAction | ReplaceAction;
+export type Action =
+  | SnapshotAction
+  | AddAction
+  | RemoveAction
+  | ReplaceAction
+  | AppendAction
+  | PrependAction;
 
 const decoder = new Decoder({ mapsAsObjects: false, useRecords: false });
 const encoder = new Encoder({ mapsAsObjects: false, useRecords: false });
@@ -237,6 +261,38 @@ function parseAction(value: unknown): Action {
     }
     return { type: REPLACE, path, value: replacement };
   }
+  if (opcode === APPEND) {
+    requireActionLength(value.length, 3);
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the APPEND path');
+    }
+    let text: string;
+    try {
+      text = parseText(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while decoding the APPEND text');
+    }
+    return { type: APPEND, path, text };
+  }
+  if (opcode === PREPEND) {
+    requireActionLength(value.length, 3);
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the PREPEND path');
+    }
+    let text: string;
+    try {
+      text = parseText(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while decoding the PREPEND text');
+    }
+    return { type: PREPEND, path, text };
+  }
   throw new JsyncError(
     JsyncErrorKind.UnknownAction,
     'The Jsync action opcode is not supported.',
@@ -274,6 +330,14 @@ function parsePath(value: unknown): PathSegment[] {
   });
 }
 
+function parseText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  throw new JsyncError(
+    JsyncErrorKind.InvalidJsonValue,
+    'The string patch text must be a CBOR text string.',
+  );
+}
+
 function normalizeAction(action: Action): Action {
   if (action.type === SNAPSHOT) {
     return { type: SNAPSHOT, value: normalizeJson(action.value) };
@@ -293,6 +357,20 @@ function normalizeAction(action: Action): Action {
       type: REPLACE,
       path: parsePath(action.path),
       value: normalizeJson(action.value),
+    };
+  }
+  if (action.type === APPEND) {
+    return {
+      type: APPEND,
+      path: parsePath(action.path),
+      text: parseText(action.text),
+    };
+  }
+  if (action.type === PREPEND) {
+    return {
+      type: PREPEND,
+      path: parsePath(action.path),
+      text: parseText(action.text),
     };
   }
   throw new JsyncError(
@@ -315,5 +393,8 @@ function encodeAction(action: Action): unknown[] {
   if (action.type === REMOVE) {
     return [REMOVE, [...action.path]];
   }
-  return [REPLACE, [...action.path], cloneJson(action.value)];
+  if (action.type === REPLACE) {
+    return [REPLACE, [...action.path], cloneJson(action.value)];
+  }
+  return [action.type, [...action.path], action.text];
 }

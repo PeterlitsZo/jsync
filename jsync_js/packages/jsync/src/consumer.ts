@@ -1,5 +1,5 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, Message, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { ADD, APPEND, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
 import { cloneJson, setOwn } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -55,6 +55,8 @@ function applyAction(root: JsonValue | undefined, action: Action): JsonValue {
   if (action.type === REPLACE) {
     return applyReplace(root, action.path, cloneJson(action.value) as JsonValue);
   }
+  if (action.type === APPEND) return applyAppend(root, action.path, action.text);
+  if (action.type === PREPEND) return applyPrepend(root, action.path, action.text);
   throw new JsyncError(JsyncErrorKind.ApplyFailed, 'The Jsync action type is not supported.');
 }
 
@@ -251,17 +253,164 @@ function applyReplace(
     .withContext('while applying the final REPLACE path segment');
 }
 
+/** Appends text to an existing string value. */
+function applyAppend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
+  if (path.length === 0) {
+    if (typeof root !== 'string') {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'The APPEND path target is not a string.',
+      ).withContext('while applying the APPEND action');
+    }
+    return `${root}${text}`;
+  }
+
+  const target = resolveActionValue(root, path, 'APPEND');
+  if (typeof target.value !== 'string') {
+    throw new JsyncError(
+      JsyncErrorKind.ApplyFailed,
+      'The APPEND path target is not a string.',
+    ).withContext('while applying the APPEND action');
+  }
+  target.set(`${target.value}${text}`);
+  return root as JsonValue;
+}
+
+/** Prepends text to an existing string value. */
+function applyPrepend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
+  if (path.length === 0) {
+    if (typeof root !== 'string') {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'The PREPEND path target is not a string.',
+      ).withContext('while applying the PREPEND action');
+    }
+    return `${text}${root}`;
+  }
+
+  const target = resolveActionValue(root, path, 'PREPEND');
+  if (typeof target.value !== 'string') {
+    throw new JsyncError(
+      JsyncErrorKind.ApplyFailed,
+      'The PREPEND path target is not a string.',
+    ).withContext('while applying the PREPEND action');
+  }
+  target.set(`${text}${target.value}`);
+  return root as JsonValue;
+}
+
 /** Resolves an existing object or array container for an action parent path. */
 function resolveActionContainer(
   root: JsonValue | undefined,
   path: PathSegment[],
-  operation: 'ADD' | 'REMOVE' | 'REPLACE',
+  operation: 'ADD' | 'REMOVE' | 'REPLACE' | 'APPEND' | 'PREPEND',
 ): JsonValue {
   try {
     return resolveContainer(root, path);
   } catch (error: unknown) {
     throw ensureJsyncError(error).withContext(`while resolving a ${operation} path parent`);
   }
+}
+
+interface ResolvedValue {
+  readonly value: JsonValue;
+  readonly set: (value: JsonValue) => void;
+}
+
+/** Resolves an existing value and setter for an action path. */
+function resolveActionValue(
+  root: JsonValue | undefined,
+  path: PathSegment[],
+  operation: 'APPEND' | 'PREPEND',
+): ResolvedValue {
+  try {
+    return resolveValue(root, path);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext(`while resolving a ${operation} path target`);
+  }
+}
+
+function resolveValue(root: JsonValue | undefined, path: PathSegment[]): ResolvedValue {
+  if (path.length === 0) {
+    if (root === undefined) {
+      throw new JsyncError(
+        JsyncErrorKind.PathParentMissing,
+        'The root document does not exist.',
+      ).withContext('while resolving a path target');
+    }
+    return {
+      value: root,
+      set(value) {
+        root = value;
+      },
+    };
+  }
+
+  const parentPath = path.slice(0, -1);
+  const finalSegment = path[path.length - 1];
+  const parent = resolveContainer(root, parentPath);
+
+  if (Array.isArray(parent)) {
+    if (typeof finalSegment !== 'number') {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'An array path segment must be an index.',
+      )
+        .withMetadata('segment', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while resolving a path target');
+    }
+    if (finalSegment >= parent.length) {
+      throw new JsyncError(
+        JsyncErrorKind.ArrayIndexOutOfBounds,
+        'The path index is outside the array.',
+      )
+        .withMetadata('index', finalSegment)
+        .withMetadata('length', parent.length)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while resolving a path target');
+    }
+    return {
+      value: parent[finalSegment],
+      set(value) {
+        parent[finalSegment] = value;
+      },
+    };
+  }
+
+  if (isObject(parent)) {
+    if (typeof finalSegment !== 'string') {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'An object path segment must be a string.',
+      )
+        .withMetadata('index', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while resolving a path target');
+    }
+    if (!Object.hasOwn(parent, finalSegment)) {
+      throw new JsyncError(
+        JsyncErrorKind.PathParentMissing,
+        'The path object key does not exist.',
+      )
+        .withMetadata('key', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while resolving a path target');
+    }
+    return {
+      value: parent[finalSegment],
+      set(value) {
+        setOwn(parent, finalSegment, value);
+      },
+    };
+  }
+
+  throw new JsyncError(
+    JsyncErrorKind.PathParentNotContainer,
+    'The path traversed a scalar.',
+  )
+    .withMetadata('segment_index', path.length - 1)
+    .withContext('while resolving a path target');
 }
 
 /** Resolves an existing object or array container without action-specific context. */
