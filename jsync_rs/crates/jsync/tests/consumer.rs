@@ -293,3 +293,171 @@ fn rejects_non_json_cbor_values_and_trailing_bytes() {
     valid.push(0);
     assert_code(consumer.consume(&valid), JsyncErrorKind::TrailingBytes);
 }
+
+#[test]
+fn removes_and_replaces_object_keys_and_root() {
+    let mut consumer = Consumer::new();
+    consumer
+        .consume(&message(json!([[0, {"a": 1, "b": 2, "nullable": null}]])))
+        .unwrap();
+
+    consumer
+        .consume(&message(json!([
+            [3, ["a"], {"nested": true}],
+            [2, ["b"]],
+            [3, ["nullable"], "present"]
+        ])))
+        .unwrap();
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({"a": {"nested": true}, "nullable": "present"}))
+    );
+
+    consumer
+        .consume(&message(json!([[3, [], ["new-root"]]])))
+        .unwrap();
+    assert_eq!(consumer.document(), Some(&json!(["new-root"])));
+}
+
+#[test]
+fn removes_and_replaces_array_elements_in_order() {
+    let mut consumer = Consumer::new();
+    consumer
+        .consume(&message(json!([[0, {"list": ["A", "B", "C"]}]])))
+        .unwrap();
+
+    consumer
+        .consume(&message(json!([
+            [2, ["list", 1]],
+            [3, ["list", 1], "D"],
+            [3, ["list", 0], "first"]
+        ])))
+        .unwrap();
+    assert_eq!(consumer.document(), Some(&json!({"list": ["first", "D"]})));
+}
+
+#[test]
+fn validates_remove_and_replace_action_shapes_and_values() {
+    let mut consumer = Consumer::new();
+    assert_code(
+        consumer.consume(&message(json!([[2]]))),
+        JsyncErrorKind::InvalidActionLength,
+    );
+    assert_code(
+        consumer.consume(&message(json!([[2, [], 1]]))),
+        JsyncErrorKind::InvalidActionLength,
+    );
+    assert_code(
+        consumer.consume(&message(json!([[3, []]]))),
+        JsyncErrorKind::InvalidActionLength,
+    );
+    assert_code(
+        consumer.consume(&message(json!([[3, [], 1, 2]]))),
+        JsyncErrorKind::InvalidActionLength,
+    );
+
+    let mut bytes = HEADER.to_vec();
+    let payload = CborValue::Array(vec![CborValue::Array(vec![
+        CborValue::Integer(3.into()),
+        CborValue::Array(Vec::new()),
+        CborValue::Bytes(vec![1]),
+    ])]);
+    into_writer(&payload, &mut bytes).unwrap();
+    let error = Consumer::new()
+        .consume(&bytes)
+        .expect_err("REPLACE values must be legal JSON values");
+    assert_eq!(error.kind, JsyncErrorKind::InvalidJsonValue);
+    assert_eq!(
+        error.context,
+        vec![
+            "while decoding the REPLACE value",
+            "while parsing a Jsync action",
+        ]
+    );
+}
+
+#[test]
+fn validates_remove_and_replace_paths_and_targets() {
+    let cases = [
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [2, []]]),
+            JsyncErrorKind::InvalidPath,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [2, ["obj", "missing"]]]),
+            JsyncErrorKind::PathParentMissing,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [2, ["list", 1]]]),
+            JsyncErrorKind::ArrayIndexOutOfBounds,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [2, ["list", "-"]]]),
+            JsyncErrorKind::InvalidPath,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [2, ["obj", 0]]]),
+            JsyncErrorKind::InvalidPath,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [3, ["obj", "missing"], 1]]),
+            JsyncErrorKind::PathParentMissing,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [3, ["list", 1], 1]]),
+            JsyncErrorKind::ArrayIndexOutOfBounds,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [3, ["list", "-"], 1]]),
+            JsyncErrorKind::InvalidPath,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [3, ["obj", 0], 1]]),
+            JsyncErrorKind::InvalidPath,
+        ),
+        (
+            json!([[0, {"obj": {"present": 1}, "list": ["A"], "scalar": 1}], [3, ["scalar", "x"], 1]]),
+            JsyncErrorKind::PathParentNotContainer,
+        ),
+    ];
+
+    for (payload, expected) in cases {
+        let mut consumer = Consumer::new();
+        assert_code(consumer.consume(&message(payload)), expected);
+    }
+}
+
+#[test]
+fn rolls_back_remove_and_replace_failures() {
+    let mut consumer = Consumer::new();
+    consumer
+        .consume(&message(json!([[0, {"a": 1, "b": 2, "list": ["A"]}]])))
+        .unwrap();
+
+    assert_code(
+        consumer.consume(&message(json!([
+            [2, ["a"]],
+            [3, ["b"], 3],
+            [2, ["missing"]]
+        ]))),
+        JsyncErrorKind::PathParentMissing,
+    );
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({"a": 1, "b": 2, "list": ["A"]}))
+    );
+
+    let mut first_message = Consumer::new();
+    assert_code(
+        first_message.consume(&message(json!([
+            [0, {"a": 1}],
+            [2, ["missing"]]
+        ]))),
+        JsyncErrorKind::PathParentMissing,
+    );
+    assert_eq!(first_message.document(), None);
+    first_message
+        .consume(&message(json!([[0, {"ready": true}]])))
+        .unwrap();
+    assert_eq!(first_message.document(), Some(&json!({"ready": true})));
+}

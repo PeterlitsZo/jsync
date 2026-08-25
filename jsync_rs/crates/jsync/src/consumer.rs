@@ -99,6 +99,8 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
             Ok(())
         }
         Action::Add { path, value } => apply_add(root, &path, value),
+        Action::Remove { path } => apply_remove(root, &path),
+        Action::Replace { path, value } => apply_replace(root, &path, value),
     }
 }
 
@@ -110,7 +112,8 @@ fn apply_add(root: &mut Value, path: &[PathSegment], value: Value) -> Result<(),
     }
 
     let (parent_path, final_segment) = path.split_at(path.len() - 1);
-    let parent = resolve_container(root, parent_path)?;
+    let parent = resolve_container(root, parent_path)
+        .map_err(|error| error.with_context("while resolving an ADD path parent"))?;
     match (parent, &final_segment[0]) {
         (Value::Object(object), PathSegment::Key(key)) => {
             object.insert(key.clone(), value);
@@ -159,7 +162,136 @@ fn apply_add(root: &mut Value, path: &[PathSegment], value: Value) -> Result<(),
     }
 }
 
-/// Resolves an existing object or array container for an ADD parent path.
+/// Removes an existing value from an object, array, or root path.
+fn apply_remove(root: &mut Value, path: &[PathSegment]) -> Result<(), JsyncError> {
+    if path.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "The REMOVE path cannot target the root document.",
+        )
+        .with_context("while applying the final REMOVE path segment"));
+    }
+
+    let (parent_path, final_segment) = path.split_at(path.len() - 1);
+    let parent = resolve_container(root, parent_path)
+        .map_err(|error| error.with_context("while resolving a REMOVE path parent"))?;
+    match (parent, &final_segment[0]) {
+        (Value::Object(object), PathSegment::Key(key)) => {
+            if object.remove(key).is_some() {
+                Ok(())
+            } else {
+                Err(JsyncError::new(
+                    JsyncErrorKind::PathParentMissing,
+                    "The REMOVE object key does not exist.",
+                )
+                .with_metadata("key", key.clone())
+                .with_metadata("segment_index", (path.len() - 1).to_string())
+                .with_context("while applying the final REMOVE path segment"))
+            }
+        }
+        (Value::Array(array), PathSegment::Index(index)) => {
+            if *index >= array.len() {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::ArrayIndexOutOfBounds,
+                    "The REMOVE index is outside the array.",
+                )
+                .with_metadata("index", index.to_string())
+                .with_metadata("length", array.len().to_string())
+                .with_metadata("segment_index", (path.len() - 1).to_string())
+                .with_context("while applying the final REMOVE path segment"));
+            }
+            array.remove(*index);
+            Ok(())
+        }
+        (Value::Array(_), PathSegment::Key(key)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A REMOVE array final segment must be a non-negative integer; '-' is only valid for ADD.",
+        )
+        .with_metadata("segment", key.clone())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final REMOVE path segment")),
+        (Value::Object(_), PathSegment::Index(index)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A REMOVE object final segment must be a string.",
+        )
+        .with_metadata("index", index.to_string())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final REMOVE path segment")),
+        (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_), _) => Err(
+            JsyncError::new(
+                JsyncErrorKind::PathParentNotContainer,
+                "The REMOVE path parent is a scalar instead of an object or array.",
+            )
+            .with_metadata("segment_index", (path.len() - 1).to_string())
+            .with_context("while applying the final REMOVE path segment"),
+        ),
+    }
+}
+
+/// Replaces an existing value at an object, array, or root path.
+fn apply_replace(root: &mut Value, path: &[PathSegment], value: Value) -> Result<(), JsyncError> {
+    if path.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+
+    let (parent_path, final_segment) = path.split_at(path.len() - 1);
+    let parent = resolve_container(root, parent_path)
+        .map_err(|error| error.with_context("while resolving a REPLACE path parent"))?;
+    match (parent, &final_segment[0]) {
+        (Value::Object(object), PathSegment::Key(key)) => {
+            if !object.contains_key(key) {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::PathParentMissing,
+                    "The REPLACE object key does not exist.",
+                )
+                .with_metadata("key", key.clone())
+                .with_metadata("segment_index", (path.len() - 1).to_string())
+                .with_context("while applying the final REPLACE path segment"));
+            }
+            object.insert(key.clone(), value);
+            Ok(())
+        }
+        (Value::Array(array), PathSegment::Index(index)) => {
+            if *index >= array.len() {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::ArrayIndexOutOfBounds,
+                    "The REPLACE index is outside the array.",
+                )
+                .with_metadata("index", index.to_string())
+                .with_metadata("length", array.len().to_string())
+                .with_metadata("segment_index", (path.len() - 1).to_string())
+                .with_context("while applying the final REPLACE path segment"));
+            }
+            array[*index] = value;
+            Ok(())
+        }
+        (Value::Array(_), PathSegment::Key(key)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A REPLACE array final segment must be a non-negative integer; '-' is only valid for ADD.",
+        )
+        .with_metadata("segment", key.clone())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final REPLACE path segment")),
+        (Value::Object(_), PathSegment::Index(index)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A REPLACE object final segment must be a string.",
+        )
+        .with_metadata("index", index.to_string())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final REPLACE path segment")),
+        (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_), _) => Err(
+            JsyncError::new(
+                JsyncErrorKind::PathParentNotContainer,
+                "The REPLACE path parent is a scalar instead of an object or array.",
+            )
+            .with_metadata("segment_index", (path.len() - 1).to_string())
+            .with_context("while applying the final REPLACE path segment"),
+        ),
+    }
+}
+
+/// Resolves an existing object or array container for an action parent path.
 fn resolve_container<'a>(
     mut current: &'a mut Value,
     path: &[PathSegment],
@@ -170,11 +302,11 @@ fn resolve_container<'a>(
                 object.get_mut(key).ok_or_else(|| {
                     JsyncError::new(
                         JsyncErrorKind::PathParentMissing,
-                        "The ADD path object key does not exist.",
+                        "The path object key does not exist.",
                     )
                     .with_metadata("key", key.clone())
                     .with_metadata("segment_index", segment_index.to_string())
-                    .with_context("while resolving an ADD path parent")
+                    .with_context("while resolving a path parent")
                 })?
             }
             (Value::Array(array), PathSegment::Index(index)) => {
@@ -182,12 +314,12 @@ fn resolve_container<'a>(
                 array.get_mut(*index).ok_or_else(|| {
                     JsyncError::new(
                         JsyncErrorKind::ArrayIndexOutOfBounds,
-                        "The ADD path index is outside the array.",
+                        "The path index is outside the array.",
                     )
                     .with_metadata("index", index.to_string())
                     .with_metadata("length", length.to_string())
                     .with_metadata("segment_index", segment_index.to_string())
-                    .with_context("while resolving an ADD path parent")
+                    .with_context("while resolving a path parent")
                 })?
             }
             (Value::Array(_), PathSegment::Key(key)) => {
@@ -197,7 +329,7 @@ fn resolve_container<'a>(
                 )
                 .with_metadata("segment", key.clone())
                 .with_metadata("segment_index", segment_index.to_string())
-                .with_context("while resolving an intermediate ADD path segment"));
+                .with_context("while resolving an intermediate path segment"));
             }
             (Value::Object(_), PathSegment::Index(index)) => {
                 return Err(JsyncError::new(
@@ -206,15 +338,15 @@ fn resolve_container<'a>(
                 )
                 .with_metadata("index", index.to_string())
                 .with_metadata("segment_index", segment_index.to_string())
-                .with_context("while resolving an intermediate ADD path segment"));
+                .with_context("while resolving an intermediate path segment"));
             }
             (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_), _) => {
                 return Err(JsyncError::new(
                     JsyncErrorKind::PathParentNotContainer,
-                    "The ADD path traversed a scalar.",
+                    "The path traversed a scalar.",
                 )
                 .with_metadata("segment_index", segment_index.to_string())
-                .with_context("while resolving an ADD path parent"));
+                .with_context("while resolving a path parent"));
             }
         };
     }

@@ -3,7 +3,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::error::{JsyncError, JsyncErrorKind};
 
-/// Represents one segment in an already validated ADD path.
+/// Represents one segment in an already validated action path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PathSegment {
     /// Selects an object property by key.
@@ -25,6 +25,18 @@ pub(crate) enum Action {
         /// The validated destination path.
         path: Vec<PathSegment>,
         /// The value to insert or overwrite.
+        value: Value,
+    },
+    /// Removes the value at the given path.
+    Remove {
+        /// The validated path of the value to remove.
+        path: Vec<PathSegment>,
+    },
+    /// Replaces the value at the given path.
+    Replace {
+        /// The validated path of the value to replace.
+        path: Vec<PathSegment>,
+        /// The replacement JSON value.
         value: Value,
     },
 }
@@ -108,6 +120,24 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
                 .map_err(|error| error.with_context("while decoding the ADD value"))?;
             Ok(Action::Add { path, value })
         }
+        2 => {
+            require_action_length(action.len(), 2)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let path = parse_path(elements.next().expect("validated remove length"))
+                .map_err(|error| error.with_context("while parsing the REMOVE path"))?;
+            Ok(Action::Remove { path })
+        }
+        3 => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let path = parse_path(elements.next().expect("validated replace length"))
+                .map_err(|error| error.with_context("while parsing the REPLACE path"))?;
+            let value = to_json(elements.next().expect("validated replace length"))
+                .map_err(|error| error.with_context("while decoding the REPLACE value"))?;
+            Ok(Action::Replace { path, value })
+        }
         opcode => Err(JsyncError::new(
             JsyncErrorKind::UnknownAction,
             "The Jsync action opcode is not supported.",
@@ -137,7 +167,7 @@ fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
         _ => {
             return Err(JsyncError::new(
                 JsyncErrorKind::InvalidPath,
-                "The ADD path must be an array.",
+                "The path must be an array.",
             ));
         }
     };
@@ -151,7 +181,7 @@ fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
                 if integer < 0 {
                     return Err(JsyncError::new(
                         JsyncErrorKind::InvalidPath,
-                        "An ADD path index must be non-negative.",
+                        "A path index must be non-negative.",
                     )
                     .with_metadata("segment", integer.to_string())
                     .with_metadata("segment_index", segment_index.to_string()));
@@ -159,17 +189,14 @@ fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
                 usize::try_from(integer)
                     .map(PathSegment::Index)
                     .map_err(|_| {
-                        JsyncError::new(
-                            JsyncErrorKind::InvalidPath,
-                            "An ADD path index is too large.",
-                        )
-                        .with_metadata("segment", integer.to_string())
-                        .with_metadata("segment_index", segment_index.to_string())
+                        JsyncError::new(JsyncErrorKind::InvalidPath, "A path index is too large.")
+                            .with_metadata("segment", integer.to_string())
+                            .with_metadata("segment_index", segment_index.to_string())
                     })
             }
             _ => Err(JsyncError::new(
                 JsyncErrorKind::InvalidPath,
-                "An ADD path segment must be a string or non-negative integer.",
+                "A path segment must be a string or non-negative integer.",
             )
             .with_metadata("segment_index", segment_index.to_string())),
         })

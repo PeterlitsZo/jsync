@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { encode } from 'cbor-x';
-import { ADD, Consumer, JSYNC_HEADER, JsyncError, JsyncErrorKind, SNAPSHOT } from '../src/index.js';
+import {
+  ADD,
+  Consumer,
+  JSYNC_HEADER,
+  JsyncError,
+  JsyncErrorKind,
+  REMOVE,
+  REPLACE,
+  SNAPSHOT,
+} from '../src/index.js';
 import type { JsyncErrorCode } from '../src/index.js';
 
 function message(actions: unknown): Uint8Array {
@@ -49,6 +58,8 @@ test('renders structured errors with readable context, metadata, and source', ()
 
 test('exports protocol constants and consumes a Uint8Array', () => {
   assert.deepEqual([...JSYNC_HEADER], [0xd9, 0xff, 0x01]);
+  assert.equal(REMOVE, 2);
+  assert.equal(REPLACE, 3);
   const consumer = new Consumer();
   assert.strictEqual(consumer.consume(message([[SNAPSHOT, { list: ['A', 'B', 'C'] }]])), consumer);
   assert.deepEqual(consumer.document, { list: ['A', 'B', 'C'] });
@@ -217,4 +228,150 @@ test('preserves CBOR decoder failures as error sources', () => {
   assert.equal(error.kind, JsyncErrorKind.CborDecode);
   assert.ok(error.source instanceof Error);
   assert.match(error.toString(), /Source:/);
+});
+
+test('removes and replaces object keys and the root document', () => {
+  const consumer = new Consumer();
+  consumer.consume(message([[SNAPSHOT, { a: 1, b: 2, nullable: null }]]));
+  consumer.consume(
+    message([
+      [REPLACE, ['a'], { nested: true }],
+      [REMOVE, ['b']],
+      [REPLACE, ['nullable'], 'present'],
+    ]),
+  );
+  assert.deepEqual(consumer.document, {
+    a: { nested: true },
+    nullable: 'present',
+  });
+
+  consumer.consume(message([[REPLACE, [], ['new-root']]]));
+  assert.deepEqual(consumer.document, ['new-root']);
+});
+
+test('removes and replaces array elements in order', () => {
+  const consumer = new Consumer();
+  consumer.consume(message([[SNAPSHOT, { list: ['A', 'B', 'C'] }]]));
+  consumer.consume(
+    message([
+      [REMOVE, ['list', 1]],
+      [REPLACE, ['list', 1], 'D'],
+      [REPLACE, ['list', 0], 'first'],
+    ]),
+  );
+  assert.deepEqual(consumer.document, { list: ['first', 'D'] });
+});
+
+test('validates remove and replace action shapes and values', () => {
+  const consumer = new Consumer();
+  errorCode(() => consumer.consume(message([[REMOVE]])), JsyncErrorKind.InvalidActionLength);
+  errorCode(() => consumer.consume(message([[REMOVE, [], 1]])), JsyncErrorKind.InvalidActionLength);
+  errorCode(() => consumer.consume(message([[REPLACE, []]])), JsyncErrorKind.InvalidActionLength);
+  errorCode(
+    () => consumer.consume(message([[REPLACE, [], 1, 2]])),
+    JsyncErrorKind.InvalidActionLength,
+  );
+
+  const error = captureError(() =>
+    new Consumer().consume(message([[REPLACE, [], new Uint8Array([1])]])),
+  );
+  assert.equal(error.kind, JsyncErrorKind.InvalidJsonValue);
+  assert.deepEqual(error.context, [
+    'while decoding the REPLACE value',
+    'while parsing a Jsync action',
+    'while consuming a Jsync message',
+  ]);
+});
+
+test('validates remove and replace paths and targets', () => {
+  const cases: [unknown[], unknown[], JsyncErrorCode][] = [
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REMOVE, []],
+      JsyncErrorKind.InvalidPath,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REMOVE, ['obj', 'missing']],
+      JsyncErrorKind.PathParentMissing,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REMOVE, ['list', 1]],
+      JsyncErrorKind.ArrayIndexOutOfBounds,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REMOVE, ['list', '-']],
+      JsyncErrorKind.InvalidPath,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REMOVE, ['obj', 0]],
+      JsyncErrorKind.InvalidPath,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REPLACE, ['obj', 'missing'], 1],
+      JsyncErrorKind.PathParentMissing,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REPLACE, ['list', 1], 1],
+      JsyncErrorKind.ArrayIndexOutOfBounds,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REPLACE, ['list', '-'], 1],
+      JsyncErrorKind.InvalidPath,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REPLACE, ['obj', 0], 1],
+      JsyncErrorKind.InvalidPath,
+    ],
+    [
+      [SNAPSHOT, { obj: { present: 1 }, list: ['A'], scalar: 1 }],
+      [REPLACE, ['scalar', 'x'], 1],
+      JsyncErrorKind.PathParentNotContainer,
+    ],
+  ];
+
+  for (const [snapshot, action, kind] of cases) {
+    const consumer = new Consumer();
+    consumer.consume(message([snapshot]));
+    errorCode(() => consumer.consume(message([action])), kind);
+  }
+});
+
+test('rolls back remove and replace failures', () => {
+  const consumer = new Consumer();
+  consumer.consume(message([[SNAPSHOT, { a: 1, b: 2, list: ['A'] }]]));
+  errorCode(
+    () =>
+      consumer.consume(
+        message([
+          [REMOVE, ['a']],
+          [REPLACE, ['b'], 3],
+          [REMOVE, ['missing']],
+        ]),
+      ),
+    JsyncErrorKind.PathParentMissing,
+  );
+  assert.deepEqual(consumer.document, { a: 1, b: 2, list: ['A'] });
+
+  const firstMessage = new Consumer();
+  errorCode(
+    () =>
+      firstMessage.consume(
+        message([
+          [SNAPSHOT, { a: 1 }],
+          [REMOVE, ['missing']],
+        ]),
+      ),
+    JsyncErrorKind.PathParentMissing,
+  );
+  assert.equal(firstMessage.document, undefined);
+  firstMessage.consume(message([[SNAPSHOT, { ready: true }]]));
+  assert.deepEqual(firstMessage.document, { ready: true });
 });

@@ -7,7 +7,7 @@ export type JsonObject = { [key: string]: JsonValue };
 export type JsonArray = JsonValue[];
 /** A value in the supported JSON document model. */
 export type JsonValue = null | boolean | number | string | JsonArray | JsonObject;
-/** A validated ADD path segment. */
+/** A validated action path segment. */
 export type PathSegment = string | number;
 
 /** A validated SNAPSHOT action. */
@@ -23,8 +23,21 @@ export interface AddAction {
   readonly value: JsonValue;
 }
 
+/** A validated REMOVE action. */
+export interface RemoveAction {
+  readonly type: typeof REMOVE;
+  readonly path: PathSegment[];
+}
+
+/** A validated REPLACE action. */
+export interface ReplaceAction {
+  readonly type: typeof REPLACE;
+  readonly path: PathSegment[];
+  readonly value: JsonValue;
+}
+
 /** A validated Jsync action. */
-export type Action = SnapshotAction | AddAction;
+export type Action = SnapshotAction | AddAction | RemoveAction | ReplaceAction;
 
 /** The three-byte Jsync version 1 header. */
 export const JSYNC_HEADER = Uint8Array.from([0xd9, 0xff, 0x01]);
@@ -32,6 +45,10 @@ export const JSYNC_HEADER = Uint8Array.from([0xd9, 0xff, 0x01]);
 export const SNAPSHOT = 0;
 /** The ADD action opcode. */
 export const ADD = 1;
+/** The REMOVE action opcode. */
+export const REMOVE = 2;
+/** The REPLACE action opcode. */
+export const REPLACE = 3;
 
 const decoder = new Decoder({ mapsAsObjects: false, useRecords: false });
 
@@ -257,6 +274,32 @@ function parseAction(value: unknown): Action {
     }
     return { type: ADD, path, value: child };
   }
+  if (opcode === REMOVE) {
+    requireActionLength(value.length, 2);
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the REMOVE path');
+    }
+    return { type: REMOVE, path };
+  }
+  if (opcode === REPLACE) {
+    requireActionLength(value.length, 3);
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the REPLACE path');
+    }
+    let replacement: JsonValue;
+    try {
+      replacement = normalizeJson(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while decoding the REPLACE value');
+    }
+    return { type: REPLACE, path, value: replacement };
+  }
   throw new JsyncError(
     JsyncErrorKind.UnknownAction,
     'The Jsync action opcode is not supported.',
@@ -274,10 +317,13 @@ function requireActionLength(actual: number, expected: number): void {
     .withMetadata('actual', actual);
 }
 
-/** Validates a raw ADD path without adding semantic context. */
+/** Validates a raw action path without adding semantic context. */
 function parsePath(value: unknown): PathSegment[] {
   if (!Array.isArray(value)) {
-    throw new JsyncError(JsyncErrorKind.InvalidPath, 'The ADD path must be an array.');
+    throw new JsyncError(
+      JsyncErrorKind.InvalidPath,
+      'The path must be an array.',
+    );
   }
   return value.map((segment: unknown, segmentIndex: number) => {
     if (typeof segment === 'string') return segment;
@@ -286,7 +332,7 @@ function parsePath(value: unknown): PathSegment[] {
     }
     throw new JsyncError(
       JsyncErrorKind.InvalidPath,
-      'An ADD path segment must be a string or non-negative integer.',
+      'A path segment must be a string or non-negative integer.',
     ).withMetadata('segment_index', segmentIndex);
   });
 }
