@@ -145,6 +145,16 @@ export class ProducerPathSegmentPool {
     return new ProducerPathSegmentPool(this.#segments);
   }
 
+  /** @internal */
+  indexOf(segment: PathSegment): number | undefined {
+    return this.#indexes.get(segmentKey(segment));
+  }
+
+  /** @internal Returns the committed pool size for producer-side cost simulation. */
+  get size(): number {
+    return this.#segments.length;
+  }
+
   withTransaction<T>(callback: (transaction: ProducerPathSegmentPoolTransaction) => T): T {
     const checkpoint = this.#segments.length;
     const transaction = new ProducerPathSegmentPoolTransaction(

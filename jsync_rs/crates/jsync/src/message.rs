@@ -177,6 +177,16 @@ impl ProducerPathSegmentPool {
         index
     }
 
+    pub(crate) fn index_of(&self, segment: &PathSegment) -> Option<usize> {
+        self.indexes.get(segment).copied()
+    }
+
+    /// Returns the committed pool size so producer-side estimators can simulate
+    /// future appended segment indexes without mutating the real pool.
+    pub(crate) fn len(&self) -> usize {
+        self.segments.len()
+    }
+
     fn rollback_to(&mut self, len: usize) {
         if len >= self.segments.len() {
             return;
