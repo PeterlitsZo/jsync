@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@noble/hashes": "^2.3.0",
     "cbor-x": "1.6.5"
   },
   "devDependencies": {

@@ -1,3 +1,5 @@
+import { blake3 } from '@noble/hashes/blake3.js';
+
 import { JsyncError, JsyncErrorKind } from './error.js';
 import {
   ADD,
@@ -107,16 +109,23 @@ function diffObjects(
   const added = Object.keys(next)
     .filter((key) => !Object.hasOwn(old, key))
     .sort();
+  const addedByDigest = new Map<string, string[]>();
+  const addedDigests = new Map<string, string>();
+  for (const key of added) {
+    const digest = digestValue(next[key]);
+    addedDigests.set(key, digest);
+    pushDigestKey(addedByDigest, digest, key);
+  }
 
   const remainingRemoved: string[] = [];
   for (const key of removed) {
-    const addedIndex = added.findIndex((addedKey) => deepEqual(old[key], next[addedKey]));
-    if (addedIndex === -1) {
+    const oldDigest = digestValue(old[key]);
+    const addedKey = addedByDigest.get(oldDigest)?.[0];
+    if (addedKey === undefined) {
       remainingRemoved.push(key);
       continue;
     }
 
-    const [addedKey] = added.splice(addedIndex, 1);
     const moveAction: Action = {
       type: MOVE,
       from: childPath(path, key),
@@ -127,11 +136,12 @@ function diffObjects(
       { type: ADD, path: childPath(path, addedKey), value: cloneJson(next[addedKey]) as JsonValue },
     ];
     if (plan([moveAction], pathSegmentPool).cost < plan(fallback, pathSegmentPool).cost) {
+      removeSortedKey(added, addedKey);
+      addedDigests.delete(addedKey);
+      addedByDigest.get(oldDigest)?.shift();
       actions.push(moveAction);
     } else {
       remainingRemoved.push(key);
-      added.push(addedKey);
-      added.sort();
     }
   }
 
@@ -142,11 +152,17 @@ function diffObjects(
   const common = Object.keys(old)
     .filter((key) => Object.hasOwn(next, key))
     .sort();
-  const unchanged = common.filter((key) => deepEqual(old[key], next[key]));
+  const unchangedByDigest = new Map<string, string[]>();
+  for (const key of common) {
+    const oldDigest = digestValue(old[key]);
+    if (oldDigest === digestValue(next[key])) {
+      pushDigestKey(unchangedByDigest, oldDigest, key);
+    }
+  }
 
   const remainingAdded: string[] = [];
   for (const key of added) {
-    const source = unchanged.find((sourceKey) => deepEqual(old[sourceKey], next[key]));
+    const source = unchangedByDigest.get(addedDigests.get(key)!)?.[0];
     if (source === undefined) {
       remainingAdded.push(key);
       continue;
@@ -188,6 +204,116 @@ function diffObjects(
 
 function childPath(path: PathSegment[], key: string): PathSegment[] {
   return [...path, key];
+}
+
+function pushDigestKey(index: Map<string, string[]>, digest: string, key: string): void {
+  const keys = index.get(digest);
+  if (keys === undefined) {
+    index.set(digest, [key]);
+  } else {
+    keys.push(key);
+  }
+}
+
+function removeSortedKey(keys: string[], key: string): void {
+  const index = keys.indexOf(key);
+  if (index !== -1) keys.splice(index, 1);
+}
+
+function digestValue(value: JsonValue): string {
+  const hasher = blake3.create();
+  updateDigestValue(hasher, value);
+  return bytesToHex(hasher.digest());
+}
+
+type ValueDigestHasher = ReturnType<typeof blake3.create>;
+
+const DIGEST_TEXT_ENCODER = new TextEncoder();
+
+function updateDigestValue(hasher: ValueDigestHasher, value: JsonValue): void {
+  if (value === null) {
+    hasher.update(Uint8Array.of(0x4e));
+    return;
+  }
+  if (typeof value === 'boolean') {
+    hasher.update(value ? Uint8Array.of(0x42, 0x31) : Uint8Array.of(0x42, 0x30));
+    return;
+  }
+  if (typeof value === 'number') {
+    updateDigestNumber(hasher, value);
+    return;
+  }
+  if (typeof value === 'string') {
+    hasher.update(Uint8Array.of(0x53));
+    updateDigestBytes(hasher, DIGEST_TEXT_ENCODER.encode(value));
+    return;
+  }
+  if (Array.isArray(value)) {
+    hasher.update(Uint8Array.of(0x41));
+    updateDigestLength(hasher, value.length);
+    for (const child of value) {
+      updateDigestValue(hasher, child);
+    }
+    return;
+  }
+
+  hasher.update(Uint8Array.of(0x4f));
+  const keys = Object.keys(value).sort();
+  updateDigestLength(hasher, keys.length);
+  for (const key of keys) {
+    hasher.update(Uint8Array.of(0x4b));
+    updateDigestBytes(hasher, DIGEST_TEXT_ENCODER.encode(key));
+    updateDigestValue(hasher, value[key]);
+  }
+}
+
+function updateDigestNumber(hasher: ValueDigestHasher, value: number): void {
+  if (!Number.isFinite(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'A non-finite number is not allowed in JSON.',
+    );
+  }
+  if (Number.isInteger(value)) {
+    if (!Number.isSafeInteger(value)) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'The JSON integer is outside the cross-language safe integer range.',
+      )
+        .withMetadata('minimum', Number.MIN_SAFE_INTEGER)
+        .withMetadata('maximum', Number.MAX_SAFE_INTEGER)
+        .withMetadata('value', value);
+    }
+    updateDigestInteger(hasher, value);
+    return;
+  }
+
+  hasher.update(Uint8Array.of(0x46));
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setFloat64(0, value, false);
+  hasher.update(bytes);
+}
+
+function updateDigestInteger(hasher: ValueDigestHasher, value: number): void {
+  hasher.update(Uint8Array.of(0x49));
+  updateDigestBytes(hasher, DIGEST_TEXT_ENCODER.encode(value.toString()));
+}
+
+function updateDigestBytes(hasher: ValueDigestHasher, bytes: Uint8Array): void {
+  updateDigestLength(hasher, bytes.length);
+  hasher.update(bytes);
+}
+
+function updateDigestLength(hasher: ValueDigestHasher, length: number): void {
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, Math.floor(length / 0x1_0000_0000), false);
+  view.setUint32(4, length >>> 0, false);
+  hasher.update(bytes);
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function diffArrays(

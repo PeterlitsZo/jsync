@@ -10,6 +10,9 @@ importers:
 
   packages/jsync:
     dependencies:
+      '@noble/hashes':
+        specifier: ^2.3.0
+        version: 2.3.0
       cbor-x:
         specifier: 1.6.5
         version: 1.6.5
@@ -200,6 +203,10 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@noble/hashes@2.3.0':
+    resolution: {integrity: sha512-oN+QwyX7VSHotibwubG3kpzbwKrfnyR6OOO+3Nk/53ADL7FmgHHz4TgrbaYKvvOw09u6QTx0oiH1cNCIOuN0CQ==}
+    engines: {node: '>= 20.19.0'}
+
   '@types/node@22.10.2':
     resolution: {integrity: sha512-Xxr6BBRCAOQixvonOye19wnzyDiUtTeqldOOmj3CkeblonbccA12PFwlufvRdrpjXxqnmUaeiU5EOA+7s5diUQ==}
 
@@ -338,6 +345,8 @@ snapshots:
 
   '@esbuild/win32-x64@0.23.1':
     optional: true
+
+  '@noble/hashes@2.3.0': {}
 
   '@types/node@22.10.2':
     dependencies:

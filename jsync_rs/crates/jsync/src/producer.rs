@@ -78,6 +78,8 @@ struct DiffPlan {
     cost: usize,
 }
 
+type ValueDigest = [u8; 32];
+
 fn build_diff(
     from: &Value,
     to: &Value,
@@ -129,16 +131,27 @@ fn diff_objects(
         .cloned()
         .collect::<Vec<_>>();
     added.sort();
+    let mut added_by_digest = HashMap::<ValueDigest, Vec<String>>::new();
+    let mut added_digests = HashMap::<String, ValueDigest>::new();
+    for key in &added {
+        let digest = digest_value(&new[key.as_str()])?;
+        added_digests.insert(key.clone(), digest);
+        added_by_digest.entry(digest).or_default().push(key.clone());
+    }
 
     // Handle the key deletion.
     let mut move_actions = Vec::new();
     let mut remaining_removed = Vec::new();
     for key in removed {
-        if let Some(added_index) = added
-            .iter()
-            .position(|added_key| old[&key] == new[added_key])
+        let old_digest = digest_value(&old[key.as_str()])?;
+        if let Some(added_key) = added_by_digest
+            .get(&old_digest)
+            .and_then(|bucket| bucket.first())
+            .cloned()
         {
-            let added_key = added.remove(added_index);
+            // If the old value matches the added value, move it instead of
+            // removing it.
+
             let move_action = Action::Move {
                 from: child_path(path, &key),
                 path: child_path(path, &added_key),
@@ -155,11 +168,14 @@ fn diff_objects(
             if plan(vec![move_action.clone()], path_segment_pool)?.cost
                 < plan(fallback.clone(), path_segment_pool)?.cost
             {
+                remove_sorted_key(&mut added, &added_key);
+                added_digests.remove(&added_key);
+                if let Some(bucket) = added_by_digest.get_mut(&old_digest) {
+                    bucket.remove(0);
+                }
                 move_actions.push(move_action);
             } else {
                 remaining_removed.push(key);
-                added.push(added_key);
-                added.sort();
             }
         } else {
             remaining_removed.push(key);
@@ -179,18 +195,24 @@ fn diff_objects(
         .cloned()
         .collect::<Vec<_>>();
     common.sort();
-    let unchanged = common
-        .iter()
-        .filter(|key| old[key.as_str()] == new[key.as_str()])
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut unchanged_by_digest = HashMap::<ValueDigest, Vec<String>>::new();
+    for key in &common {
+        let old_digest = digest_value(&old[key.as_str()])?;
+        if old_digest == digest_value(&new[key.as_str()])? {
+            unchanged_by_digest
+                .entry(old_digest)
+                .or_default()
+                .push(key.clone());
+        }
+    }
 
     // Handle the key addition.
     let mut remaining_added = Vec::new();
     for key in added {
-        if let Some(source) = unchanged
-            .iter()
-            .find(|source| old[source.as_str()] == new[&key])
+        let new_digest = added_digests[&key];
+        if let Some(source) = unchanged_by_digest
+            .get(&new_digest)
+            .and_then(|bucket| bucket.first())
         {
             let copy_action = Action::Copy {
                 from: child_path(path, source),
@@ -241,6 +263,102 @@ fn child_path(path: &[PathSegment], key: &str) -> Vec<PathSegment> {
     let mut target = path.to_vec();
     target.push(PathSegment::Key(key.to_string()));
     target
+}
+
+fn remove_sorted_key(keys: &mut Vec<String>, key: &str) {
+    if let Ok(index) = keys.binary_search_by(|candidate| candidate.as_str().cmp(key)) {
+        keys.remove(index);
+    }
+}
+
+fn digest_value(value: &Value) -> Result<ValueDigest, JsyncError> {
+    let mut hasher = blake3::Hasher::new();
+    update_digest_value(&mut hasher, value)?;
+    Ok(hasher.finalize().into())
+}
+
+fn update_digest_value(hasher: &mut blake3::Hasher, value: &Value) -> Result<(), JsyncError> {
+    match value {
+        Value::Null => hasher.update(b"N"),
+        Value::Bool(false) => hasher.update(b"B0"),
+        Value::Bool(true) => hasher.update(b"B1"),
+        Value::Number(number) => return update_digest_number(hasher, number),
+        Value::String(value) => {
+            hasher.update(b"S");
+            update_digest_bytes(hasher, value.as_bytes())
+        }
+        Value::Array(values) => {
+            hasher.update(b"A");
+            update_digest_len(hasher, values.len());
+            for value in values {
+                update_digest_value(hasher, value)?;
+            }
+            hasher
+        }
+        Value::Object(object) => {
+            hasher.update(b"O");
+            update_digest_len(hasher, object.len());
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                hasher.update(b"K");
+                update_digest_bytes(hasher, key.as_bytes());
+                update_digest_value(hasher, &object[key])?;
+            }
+            hasher
+        }
+    };
+    Ok(())
+}
+
+fn update_digest_number(hasher: &mut blake3::Hasher, number: &Number) -> Result<(), JsyncError> {
+    if let Some(value) = number.as_i64() {
+        validate_safe_json_integer(value as i128)?;
+        update_digest_integer(hasher, value as i128);
+        return Ok(());
+    }
+    if let Some(value) = number.as_u64() {
+        validate_safe_json_integer(value as i128)?;
+        update_digest_integer(hasher, value as i128);
+        return Ok(());
+    }
+
+    let text = number.to_string();
+    if !text.contains('.') && !text.contains('e') && !text.contains('E') {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The JSON integer is outside the supported CBOR integer range.",
+        ));
+    }
+    if let Some(value) = number.as_f64() {
+        validate_safe_json_float(value)?;
+        if value.fract() == 0.0 {
+            update_digest_integer(hasher, value as i128);
+        } else {
+            hasher.update(b"F");
+            hasher.update(&value.to_be_bytes());
+        }
+        return Ok(());
+    }
+
+    Err(JsyncError::new(
+        JsyncErrorKind::InvalidJsonValue,
+        "The JSON number cannot be encoded as a CBOR number.",
+    ))
+}
+
+fn update_digest_integer(hasher: &mut blake3::Hasher, value: i128) {
+    hasher.update(b"I");
+    update_digest_bytes(hasher, value.to_string().as_bytes());
+}
+
+fn update_digest_bytes<'a>(hasher: &'a mut blake3::Hasher, bytes: &[u8]) -> &'a mut blake3::Hasher {
+    update_digest_len(hasher, bytes.len());
+    hasher.update(bytes)
+}
+
+fn update_digest_len(hasher: &mut blake3::Hasher, len: usize) {
+    hasher.update(&(len as u64).to_be_bytes());
 }
 
 fn diff_arrays(
