@@ -1,5 +1,16 @@
 import { JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, APPEND, COPY, MOVE, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import {
+  ADD,
+  APPEND,
+  COPY,
+  MOVE,
+  Message,
+  PREPEND,
+  ProducerPathSegmentPool,
+  REMOVE,
+  REPLACE,
+  SNAPSHOT,
+} from './message.js';
 import { cloneJson, normalizeJson } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -8,6 +19,7 @@ import type { JsonObject, JsonValue } from './value.js';
 export class Producer {
   #document: JsonValue;
   #lastEmittedDocument: JsonValue | undefined;
+  readonly #pathSegmentPool = new ProducerPathSegmentPool();
 
   /** Creates a producer with the initial JSON document. */
   constructor(initialDocument: JsonValue) {
@@ -32,7 +44,12 @@ export class Producer {
     } else if (deepEqual(this.#lastEmittedDocument, this.#document)) {
       return undefined;
     } else {
-      actions = buildDiff(this.#lastEmittedDocument, this.#document, []).actions;
+      actions = buildDiff(
+        this.#lastEmittedDocument,
+        this.#document,
+        [],
+        this.#pathSegmentPool,
+      ).actions;
       if (actions.length === 0) {
         throw new JsyncError(
           JsyncErrorKind.ApplyFailed,
@@ -41,9 +58,11 @@ export class Producer {
       }
     }
 
-    const message = new Message(actions).toBytes();
-    this.#lastEmittedDocument = cloneJson(this.#document) as JsonValue;
-    return message;
+    return this.#pathSegmentPool.withTransaction((transaction) => {
+      const message = new Message(actions).toBytesWithPoolTxn(transaction);
+      this.#lastEmittedDocument = cloneJson(this.#document) as JsonValue;
+      return message;
+    });
   }
 }
 
@@ -56,19 +75,20 @@ function buildDiff(
   from: JsonValue,
   to: JsonValue,
   path: PathSegment[],
+  pathSegmentPool: ProducerPathSegmentPool,
 ): DiffPlan {
   if (deepEqual(from, to)) return plan([]);
 
-  const replace = replacePlan(path, to);
+  const replace = replacePlan(path, to, pathSegmentPool);
 
   if (isObject(from) && isObject(to)) {
-    return chooseSmaller(diffObjects(from, to, path), replace);
+    return chooseSmaller(diffObjects(from, to, path, pathSegmentPool), replace);
   }
   if (Array.isArray(from) && Array.isArray(to)) {
-    return chooseSmaller(diffArrays(from, to, path), replace);
+    return chooseSmaller(diffArrays(from, to, path, pathSegmentPool), replace);
   }
   if (typeof from === 'string' && typeof to === 'string') {
-    return diffStrings(from, to, path, replace);
+    return diffStrings(from, to, path, replace, pathSegmentPool);
   }
   return replace;
 }
@@ -77,6 +97,7 @@ function diffObjects(
   old: JsonObject,
   next: JsonObject,
   path: PathSegment[],
+  pathSegmentPool: ProducerPathSegmentPool,
 ): DiffPlan {
   const actions: Action[] = [];
 
@@ -105,7 +126,7 @@ function diffObjects(
       { type: REMOVE, path: childPath(path, key) },
       { type: ADD, path: childPath(path, addedKey), value: cloneJson(next[addedKey]) as JsonValue },
     ];
-    if (plan([moveAction]).cost < plan(fallback).cost) {
+    if (plan([moveAction], pathSegmentPool).cost < plan(fallback, pathSegmentPool).cost) {
       actions.push(moveAction);
     } else {
       remainingRemoved.push(key);
@@ -141,7 +162,7 @@ function diffObjects(
       path: childPath(path, key),
       value: cloneJson(next[key]) as JsonValue,
     };
-    if (plan([copyAction]).cost < plan([fallback]).cost) {
+    if (plan([copyAction], pathSegmentPool).cost < plan([fallback], pathSegmentPool).cost) {
       actions.push(copyAction);
     } else {
       remainingAdded.push(key);
@@ -149,7 +170,9 @@ function diffObjects(
   }
 
   for (const key of common) {
-    actions.push(...buildDiff(old[key], next[key], [...path, key]).actions);
+    actions.push(
+      ...buildDiff(old[key], next[key], [...path, key], pathSegmentPool).actions,
+    );
   }
 
   for (const key of remainingAdded) {
@@ -160,7 +183,7 @@ function diffObjects(
     });
   }
 
-  return plan(actions);
+  return plan(actions, pathSegmentPool);
 }
 
 function childPath(path: PathSegment[], key: string): PathSegment[] {
@@ -171,12 +194,15 @@ function diffArrays(
   old: JsonValue[],
   next: JsonValue[],
   path: PathSegment[],
+  pathSegmentPool: ProducerPathSegmentPool,
 ): DiffPlan {
   const actions: Action[] = [];
 
   const commonLength = Math.min(old.length, next.length);
   for (let index = 0; index < commonLength; index += 1) {
-    actions.push(...buildDiff(old[index], next[index], [...path, index]).actions);
+    actions.push(
+      ...buildDiff(old[index], next[index], [...path, index], pathSegmentPool).actions,
+    );
   }
 
   for (let index = old.length - 1; index >= next.length; index -= 1) {
@@ -191,7 +217,7 @@ function diffArrays(
     });
   }
 
-  return plan(actions);
+  return plan(actions, pathSegmentPool);
 }
 
 function diffStrings(
@@ -199,13 +225,17 @@ function diffStrings(
   next: string,
   path: PathSegment[],
   replace: DiffPlan,
+  pathSegmentPool: ProducerPathSegmentPool,
 ): DiffPlan {
   let best = replace;
 
   if (next.startsWith(old)) {
     const suffix = next.slice(old.length);
     if (suffix.length > 0) {
-      const append = plan([{ type: APPEND, path: [...path], text: suffix }]);
+      const append = plan(
+        [{ type: APPEND, path: [...path], text: suffix }],
+        pathSegmentPool,
+      );
       if (append.cost < best.cost) best = append;
     }
   }
@@ -213,7 +243,10 @@ function diffStrings(
   if (next.endsWith(old)) {
     const prefix = next.slice(0, next.length - old.length);
     if (prefix.length > 0) {
-      const prepend = plan([{ type: PREPEND, path: [...path], text: prefix }]);
+      const prepend = plan(
+        [{ type: PREPEND, path: [...path], text: prefix }],
+        pathSegmentPool,
+      );
       if (prepend.cost < best.cost) best = prepend;
     }
   }
@@ -221,14 +254,30 @@ function diffStrings(
   return best;
 }
 
-function replacePlan(path: PathSegment[], value: JsonValue): DiffPlan {
-  return plan([{ type: REPLACE, path: [...path], value: cloneJson(value) as JsonValue }]);
+function replacePlan(
+  path: PathSegment[],
+  value: JsonValue,
+  pathSegmentPool: ProducerPathSegmentPool,
+): DiffPlan {
+  return plan(
+    [{ type: REPLACE, path: [...path], value: cloneJson(value) as JsonValue }],
+    pathSegmentPool,
+  );
 }
 
-function plan(actions: Action[]): DiffPlan {
+function plan(
+  actions: Action[],
+  pathSegmentPool: ProducerPathSegmentPool = new ProducerPathSegmentPool(),
+): DiffPlan {
+  const pooledPathSegmentPool = pathSegmentPool.clone();
+  const cost = actions.length === 0
+    ? 0
+    : pooledPathSegmentPool.withTransaction((transaction) => (
+      new Message(actions).toBytesWithPoolTxn(transaction).length
+    ));
   return {
     actions,
-    cost: actions.length === 0 ? 0 : new Message(actions).toBytes().length,
+    cost,
   };
 }
 

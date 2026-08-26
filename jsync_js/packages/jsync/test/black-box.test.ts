@@ -9,6 +9,7 @@ import {
   MOVE,
   PREPEND,
   Producer,
+  ProducerPathSegmentPool,
   REMOVE,
   REPLACE,
   SNAPSHOT,
@@ -95,20 +96,23 @@ test('producer messages keep consumer in sync', () => {
 
   const producer = new Producer(initial);
   const consumer = new Consumer();
+  const inspector = new Consumer();
 
   const initialMessage = producer.getMessage();
   assert.ok(initialMessage);
   assert.deepEqual(
-    Message.fromBytes(initialMessage),
+    inspector.decodeMessageDryRun(initialMessage),
     new Message([{ type: SNAPSHOT, value: initial } satisfies Action]),
   );
+  inspector.consume(initialMessage);
   consumer.consume(initialMessage);
 
   for (const [update, expectedMessage] of updates) {
     producer.update(update);
     const message = producer.getMessage();
     if (message !== undefined) {
-      assert.deepEqual(Message.fromBytes(message), expectedMessage);
+      assert.deepEqual(inspector.decodeMessageDryRun(message), expectedMessage);
+      inspector.consume(message);
       consumer.consume(message);
     }
   }
@@ -121,7 +125,22 @@ test('producer replaces object subtree when it is smaller', () => {
     wrapper: { a: 0, b: 0, c: 0, d: 0, e: 0 },
     unchanged: true,
   });
-  assert.ok(producer.getMessage());
+  const inspector = new Consumer();
+  const initialMessage = producer.getMessage();
+  assert.ok(initialMessage);
+  assert.deepEqual(
+    inspector.decodeMessageDryRun(initialMessage),
+    new Message([
+      {
+        type: SNAPSHOT,
+        value: {
+          wrapper: { a: 0, b: 0, c: 0, d: 0, e: 0 },
+          unchanged: true,
+        },
+      },
+    ]),
+  );
+  inspector.consume(initialMessage);
 
   producer.update({
     wrapper: { a: 1, b: 1, c: 1, d: 1, e: 1 },
@@ -131,7 +150,7 @@ test('producer replaces object subtree when it is smaller', () => {
   assert.ok(message);
 
   assert.deepEqual(
-    Message.fromBytes(message),
+    inspector.decodeMessageDryRun(message),
     new Message([{ type: REPLACE, path: ['wrapper'], value: { a: 1, b: 1, c: 1, d: 1, e: 1 } }]),
   );
 });
@@ -141,15 +160,20 @@ test('copy and move messages round trip', () => {
     { type: COPY, from: ['source'], path: ['target'] },
     { type: MOVE, from: ['old'], path: ['new'] },
   ]);
-  const bytes = message.toBytes();
+  const encodePool = new ProducerPathSegmentPool();
+  const inspector = new Consumer();
+  const bytes = encodePool.withTransaction((transaction) => (
+    message.toBytesWithPoolTxn(transaction)
+  ));
 
   assert.deepEqual([...bytes.slice(0, 3)], [0xd9, 0xff, 0x01]);
-  assert.deepEqual(Message.fromBytes(bytes), message);
+  assert.deepEqual(inspector.decodeMessageDryRun(bytes), message);
 });
 
 test('consumer applies copy and move actions', () => {
   const consumer = new Consumer();
-  consumer.consume(
+  const encodePool = new ProducerPathSegmentPool();
+  const message = encodePool.withTransaction((transaction) => (
     new Message([
       {
         type: SNAPSHOT,
@@ -161,7 +185,10 @@ test('consumer applies copy and move actions', () => {
       },
       { type: COPY, from: ['source'], path: ['target'] },
       { type: MOVE, from: ['items', 0], path: ['items', 2] },
-    ]).toBytes(),
+    ]).toBytesWithPoolTxn(transaction)
+  ));
+  consumer.consume(
+    message,
   );
 
   assert.deepEqual(consumer.document, {
@@ -179,14 +206,17 @@ test('producer emits copy and move actions for reused object values', () => {
     flags: { active: true, visible: false },
   };
   const producer = new Producer({ old: shared, source: shared, keep: true });
-  assert.ok(producer.getMessage());
+  const inspector = new Consumer();
+  const initialMessage = producer.getMessage();
+  assert.ok(initialMessage);
+  inspector.consume(initialMessage);
 
   producer.update({ new: shared, source: shared, target: shared, keep: true });
   const message = producer.getMessage();
   assert.ok(message);
 
   assert.deepEqual(
-    Message.fromBytes(message),
+    inspector.decodeMessageDryRun(message),
     new Message([
       { type: MOVE, from: ['old'], path: ['new'] },
       { type: COPY, from: ['source'], path: ['target'] },

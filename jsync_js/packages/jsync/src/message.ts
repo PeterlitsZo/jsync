@@ -105,20 +105,190 @@ export class Message {
     this.actions = normalized.map(cloneAction);
   }
 
-  /** Decodes and validates one complete Jsync binary message. */
-  static fromBytes(message: Uint8Array | ArrayBuffer): Message {
+  /** Decodes a message using a caller-owned consumer path segment pool transaction. */
+  static fromBytesWithPoolTxn(
+    message: Uint8Array | ArrayBuffer,
+    transaction: ConsumerPathSegmentPoolTransaction,
+  ): Message {
     const bytes = toBytes(message);
     assertHeader(bytes);
-    return new Message(parseActions(decodePayload(bytes.subarray(JSYNC_HEADER.length))));
+    return new Message(parseMessage(
+      decodePayload(bytes.subarray(JSYNC_HEADER.length)),
+      transaction,
+    ));
   }
 
-  /** Encodes this message as Jsync version 1 bytes. */
-  toBytes(): Uint8Array {
-    const payload = encoder.encode(this.#actions.map(encodeAction));
+  /** Encodes this message using a caller-owned producer path segment pool transaction. */
+  toBytesWithPoolTxn(transaction: ProducerPathSegmentPoolTransaction): Uint8Array {
+    const actions = this.#actions.map((action) => encodeAction(action, transaction));
+    const payload = encoder.encode([[transaction.appendedSegments()], actions]);
     const message = new Uint8Array(JSYNC_HEADER.length + payload.length);
     message.set(JSYNC_HEADER);
     message.set(payload, JSYNC_HEADER.length);
     return message;
+  }
+}
+
+/** Producer-side path segment pool with stable indexes and O(1) segment lookup. */
+export class ProducerPathSegmentPool {
+  readonly #segments: PathSegment[];
+  readonly #indexes = new Map<string, number>();
+
+  constructor(segments: readonly PathSegment[] = []) {
+    this.#segments = [...segments];
+    this.#segments.forEach((segment, index) => {
+      this.#indexes.set(segmentKey(segment), index);
+    });
+  }
+
+  clone(): ProducerPathSegmentPool {
+    return new ProducerPathSegmentPool(this.#segments);
+  }
+
+  withTransaction<T>(callback: (transaction: ProducerPathSegmentPoolTransaction) => T): T {
+    const checkpoint = this.#segments.length;
+    const transaction = new ProducerPathSegmentPoolTransaction(
+      (path) => path.map((segment) => this.#indexFor(segment)),
+      () => this.#appendedSince(checkpoint),
+    );
+    try {
+      const result = callback(transaction);
+      if (transaction.aborted) {
+        this.#rollbackTo(checkpoint);
+      }
+      return result;
+    } catch (error: unknown) {
+      this.#rollbackTo(checkpoint);
+      throw error;
+    }
+  }
+
+  #rollbackTo(length: number): void {
+    if (length >= this.#segments.length) return;
+    const removed = this.#segments.splice(length);
+    for (const segment of removed) {
+      this.#indexes.delete(segmentKey(segment));
+    }
+  }
+
+  #appendedSince(length: number): PathSegment[] {
+    return this.#segments.slice(length);
+  }
+
+  #indexFor(segment: PathSegment): number {
+    const key = segmentKey(segment);
+    const existing = this.#indexes.get(key);
+    if (existing !== undefined) return existing;
+
+    const index = this.#segments.length;
+    this.#segments.push(segment);
+    this.#indexes.set(key, index);
+    return index;
+  }
+}
+
+/** Producer-side path segment pool transaction. */
+export class ProducerPathSegmentPoolTransaction {
+  readonly #encodePath: (path: readonly PathSegment[]) => number[];
+  readonly #appendedSegments: () => PathSegment[];
+  #aborted = false;
+
+  constructor(
+    encodePath: (path: readonly PathSegment[]) => number[],
+    appendedSegments: () => PathSegment[],
+  ) {
+    this.#encodePath = encodePath;
+    this.#appendedSegments = appendedSegments;
+  }
+
+  encodePath(path: readonly PathSegment[]): number[] {
+    return this.#encodePath(path);
+  }
+
+  appendedSegments(): PathSegment[] {
+    return this.#appendedSegments();
+  }
+
+  abort(): void {
+    this.#aborted = true;
+  }
+
+  get aborted(): boolean {
+    return this.#aborted;
+  }
+}
+
+/** Consumer-side path segment pool with stable indexes. */
+export class ConsumerPathSegmentPool {
+  readonly #segments: PathSegment[];
+
+  constructor(segments: readonly PathSegment[] = []) {
+    this.#segments = [...segments];
+  }
+
+  withTransaction<T>(callback: (transaction: ConsumerPathSegmentPoolTransaction) => T): T {
+    const checkpoint = this.#segments.length;
+    const transaction = new ConsumerPathSegmentPoolTransaction(
+      (segments) => this.#appendSegments(segments),
+      (index) => this.#pathSegmentAt(index),
+      () => this.#segments.length,
+    );
+    try {
+      const result = callback(transaction);
+      if (transaction.aborted) {
+        this.#rollbackTo(checkpoint);
+      }
+      return result;
+    } catch (error: unknown) {
+      this.#rollbackTo(checkpoint);
+      throw error;
+    }
+  }
+
+  #appendSegments(segments: PathSegment[]): void {
+    this.#segments.push(...segments);
+  }
+
+  #pathSegmentAt(index: number): PathSegment | undefined {
+    return this.#segments[index];
+  }
+
+  #rollbackTo(length: number): void {
+    this.#segments.length = length;
+  }
+}
+
+/** Consumer-side path segment pool transaction. */
+export class ConsumerPathSegmentPoolTransaction {
+  readonly #appendSegments: (segments: PathSegment[]) => void;
+  readonly #pathSegmentAt: (index: number) => PathSegment | undefined;
+  readonly #poolLength: () => number;
+  #aborted = false;
+
+  constructor(
+    appendSegments: (segments: PathSegment[]) => void,
+    pathSegmentAt: (index: number) => PathSegment | undefined,
+    poolLength: () => number,
+  ) {
+    this.#appendSegments = appendSegments;
+    this.#pathSegmentAt = pathSegmentAt;
+    this.#poolLength = poolLength;
+  }
+
+  appendSegments(segments: PathSegment[]): void {
+    this.#appendSegments(segments);
+  }
+
+  decodePath(path: unknown): PathSegment[] {
+    return parsePooledPath(path, this.#pathSegmentAt, this.#poolLength);
+  }
+
+  abort(): void {
+    this.#aborted = true;
+  }
+
+  get aborted(): boolean {
+    return this.#aborted;
   }
 }
 
@@ -189,27 +359,67 @@ function assertHeader(bytes: Uint8Array): void {
   }
 }
 
-/** Validates a decoded Jsync action list. */
-function parseActions(value: unknown): Action[] {
+/** Validates a decoded Jsync message. */
+function parseMessage(
+  value: unknown,
+  transaction: ConsumerPathSegmentPoolTransaction,
+): Action[] {
   if (!Array.isArray(value)) {
     throw new JsyncError(
       JsyncErrorKind.MessageNotArray,
       'The Jsync message payload must be an array.',
     );
   }
-  return value.map((action: unknown, index: number) => {
+  if (value.length !== 2) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidActionLength,
+      'The Jsync message payload must contain metadata and actions.',
+    )
+      .withMetadata('expected', 2)
+      .withMetadata('actual', value.length);
+  }
+
+  const toAppendPathSegmentPool = parseMetadata(value[0]);
+  transaction.appendSegments(toAppendPathSegmentPool);
+  if (!Array.isArray(value[1])) {
+    throw new JsyncError(
+      JsyncErrorKind.MessageNotArray,
+      'The Jsync actions payload must be an array.',
+    );
+  }
+
+  const actions = value[1].map((action: unknown, index: number) => {
     try {
-      return parseAction(action);
+      return parseAction(action, transaction);
     } catch (error: unknown) {
       throw ensureJsyncError(error)
         .withMetadata('action_index', index)
         .withContext('while parsing a Jsync action');
     }
   });
+  return actions;
+}
+
+function parseMetadata(value: unknown): PathSegment[] {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.MessageNotArray,
+      'The Jsync metadata must be an array.',
+    );
+  }
+  if (value.length !== 1) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidActionLength,
+      'The Jsync metadata must contain the path segment pool append list.',
+    )
+      .withMetadata('expected', 1)
+      .withMetadata('actual', value.length);
+  }
+  return parsePath(value[0]);
 }
 
 /** Validates one raw action without relying on its position in the message. */
-function parseAction(value: unknown): Action {
+function parseAction(value: unknown, transaction: ConsumerPathSegmentPoolTransaction): Action {
   if (!Array.isArray(value)) {
     throw new JsyncError(JsyncErrorKind.ActionNotArray, 'The Jsync action must be an array.');
   }
@@ -243,7 +453,7 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let path: PathSegment[];
     try {
-      path = parsePath(value[1]);
+      path = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the ADD path');
     }
@@ -259,7 +469,7 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 2);
     let path: PathSegment[];
     try {
-      path = parsePath(value[1]);
+      path = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the REMOVE path');
     }
@@ -269,7 +479,7 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let path: PathSegment[];
     try {
-      path = parsePath(value[1]);
+      path = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the REPLACE path');
     }
@@ -285,7 +495,7 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let path: PathSegment[];
     try {
-      path = parsePath(value[1]);
+      path = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the APPEND path');
     }
@@ -301,7 +511,7 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let path: PathSegment[];
     try {
-      path = parsePath(value[1]);
+      path = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the PREPEND path');
     }
@@ -317,13 +527,13 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let from: PathSegment[];
     try {
-      from = parsePath(value[1]);
+      from = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the COPY from path');
     }
     let path: PathSegment[];
     try {
-      path = parsePath(value[2]);
+      path = transaction.decodePath(value[2]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the COPY path');
     }
@@ -333,13 +543,13 @@ function parseAction(value: unknown): Action {
     requireActionLength(value.length, 3);
     let from: PathSegment[];
     try {
-      from = parsePath(value[1]);
+      from = transaction.decodePath(value[1]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the MOVE from path');
     }
     let path: PathSegment[];
     try {
-      path = parsePath(value[2]);
+      path = transaction.decodePath(value[2]);
     } catch (error: unknown) {
       throw ensureJsyncError(error).withContext('while parsing the MOVE path');
     }
@@ -379,6 +589,43 @@ function parsePath(value: unknown): PathSegment[] {
       JsyncErrorKind.InvalidPath,
       'A path segment must be a string or non-negative integer.',
     ).withMetadata('segment_index', segmentIndex);
+  });
+}
+
+/** Validates a raw path index array against the current path segment pool. */
+function parsePooledPath(
+  value: unknown,
+  pathSegmentAt: (index: number) => PathSegment | undefined,
+  poolLength: () => number,
+): PathSegment[] {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidPath,
+      'The path must be an array.',
+    );
+  }
+  return value.map((segment: unknown, segmentIndex: number) => {
+    if (
+      typeof segment !== 'number' ||
+      !Number.isSafeInteger(segment) ||
+      segment < 0
+    ) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'A path segment pool index must be a non-negative integer.',
+      ).withMetadata('segment_index', segmentIndex);
+    }
+    const pathSegment = pathSegmentAt(segment);
+    if (pathSegment === undefined) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'A path segment pool index is outside the current pool.',
+      )
+        .withMetadata('index', segment)
+        .withMetadata('length', poolLength())
+        .withMetadata('segment_index', segmentIndex);
+    }
+    return pathSegment;
   });
 }
 
@@ -449,21 +696,29 @@ function cloneAction(action: Action): Action {
   return normalizeAction(action);
 }
 
-function encodeAction(action: Action): unknown[] {
+function encodeAction(action: Action, transaction: ProducerPathSegmentPoolTransaction): unknown[] {
   if (action.type === SNAPSHOT) {
     return [SNAPSHOT, cloneJson(action.value)];
   }
   if (action.type === ADD) {
-    return [ADD, [...action.path], cloneJson(action.value)];
+    return [ADD, transaction.encodePath(action.path), cloneJson(action.value)];
   }
   if (action.type === REMOVE) {
-    return [REMOVE, [...action.path]];
+    return [REMOVE, transaction.encodePath(action.path)];
   }
   if (action.type === REPLACE) {
-    return [REPLACE, [...action.path], cloneJson(action.value)];
+    return [REPLACE, transaction.encodePath(action.path), cloneJson(action.value)];
   }
   if (action.type === APPEND || action.type === PREPEND) {
-    return [action.type, [...action.path], action.text];
+    return [action.type, transaction.encodePath(action.path), action.text];
   }
-  return [action.type, [...action.from], [...action.path]];
+  return [
+    action.type,
+    transaction.encodePath(action.from),
+    transaction.encodePath(action.path),
+  ];
+}
+
+function segmentKey(segment: PathSegment): string {
+  return typeof segment === 'string' ? `s:${segment}` : `i:${segment}`;
 }

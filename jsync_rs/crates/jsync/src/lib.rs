@@ -8,5 +8,8 @@ mod message;
 
 pub use consumer::Consumer;
 pub use error::{JsyncError, JsyncErrorKind};
-pub use message::{Action, Message, PathSegment};
+pub use message::{
+    Action, ConsumerPathSegmentPool, ConsumerPathSegmentPoolTransaction, Message, PathSegment,
+    ProducerPathSegmentPool, ProducerPathSegmentPoolTransaction,
+};
 pub use producer::Producer;

@@ -1,4 +1,4 @@
-use jsync::{Action, Consumer, Message, PathSegment, Producer};
+use jsync::{Action, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool};
 use serde_json::{Value, json};
 
 #[test]
@@ -41,7 +41,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     value: json!(1),
                 },
             ]),
-            expected_message_bytes_len: 59,
+            expected_message_bytes_len: 67,
         },
         UpdateCase {
             to_update: json!({
@@ -77,7 +77,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     value: json!(["math", "programming"]),
                 },
             ]),
-            expected_message_bytes_len: 100,
+            expected_message_bytes_len: 80,
         },
         UpdateCase {
             to_update: json!({
@@ -99,7 +99,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     path: vec![PathSegment::Key("tags".to_string()), PathSegment::Index(1)],
                 },
             ]),
-            expected_message_bytes_len: 42,
+            expected_message_bytes_len: 29,
         },
         UpdateCase {
             to_update: json!(["root replacement", {"revision": 4}, [1, 2, 3]]),
@@ -107,7 +107,7 @@ fn producer_messages_keep_consumer_in_sync() {
                 path: vec![],
                 value: json!(["root replacement", {"revision": 4}, [1, 2, 3]]),
             }]),
-            expected_message_bytes_len: 40,
+            expected_message_bytes_len: 43,
         },
         UpdateCase {
             to_update: json!({
@@ -125,7 +125,62 @@ fn producer_messages_keep_consumer_in_sync() {
                     "tags": ["systems"],
                 }),
             }]),
-            expected_message_bytes_len: 81,
+            expected_message_bytes_len: 84,
+        },
+        UpdateCase {
+            to_update: json!({
+                "revision": 6,
+                "profile": {"name": "Peterlits", "active": false},
+                "items": ["delta", "epsilon"],
+                "tags": ["person", "male"],
+            }),
+            expected_message: Message::new(vec![
+                Action::Replace {
+                    path: vec![
+                        PathSegment::Key("profile".to_string()),
+                        PathSegment::Key("active".to_string()),
+                    ],
+                    value: json!(false),
+                },
+                Action::Replace {
+                    path: vec![
+                        PathSegment::Key("profile".to_string()),
+                        PathSegment::Key("name".to_string()),
+                    ],
+                    value: json!("Peterlits"),
+                },
+                Action::Replace {
+                    path: vec![PathSegment::Key("revision".to_string())],
+                    value: json!(6),
+                },
+                Action::Replace {
+                    path: vec![PathSegment::Key("tags".to_string())],
+                    value: json!(["person", "male"]),
+                },
+            ]),
+            expected_message_bytes_len: 50,
+        },
+        UpdateCase {
+            to_update: json!({
+                "revision": 7,
+                "profile": {"name": "Peterlits Zo", "active": false},
+                "items": ["delta", "epsilon"],
+                "tags": ["person", "male"],
+            }),
+            expected_message: Message::new(vec![
+                Action::Append {
+                    path: vec![
+                        PathSegment::Key("profile".to_string()),
+                        PathSegment::Key("name".to_string()),
+                    ],
+                    text: " Zo".to_string(),
+                },
+                Action::Replace {
+                    path: vec![PathSegment::Key("revision".to_string())],
+                    value: json!(7),
+                },
+            ]),
+            expected_message_bytes_len: 21,
         },
     ];
 
@@ -137,7 +192,9 @@ fn producer_messages_keep_consumer_in_sync() {
         .expect("initial message should be produced")
         .expect("initial snapshot should exist");
     assert_eq!(
-        Message::from_bytes(initial_message.clone()).expect("initial message should decode"),
+        consumer
+            .decode_message_dry_run(&initial_message)
+            .expect("initial message should decode"),
         Message::new(vec![Action::Snapshot {
             value: initial.clone(),
         }])
@@ -146,20 +203,23 @@ fn producer_messages_keep_consumer_in_sync() {
         .consume(&initial_message)
         .expect("consumer should accept the initial message");
 
-    for update in updates {
-        producer.update(update.to_update);
+    for (index, update) in updates.iter().enumerate() {
+        producer.update(update.to_update.clone());
         let message = producer
             .get_message()
             .expect("producer message should be encoded")
             .expect("must have message to sync");
         assert_eq!(
-            Message::from_bytes(message.clone()).expect("producer message should decode"),
+            consumer
+                .decode_message_dry_run(&message)
+                .expect("producer message should decode"),
             update.expected_message
         );
         assert_eq!(
             message.len(),
             update.expected_message_bytes_len,
-            "message length should match expected length"
+            "message length should match expected length for update {}",
+            index
         );
         consumer
             .consume(&message)
@@ -176,10 +236,14 @@ fn producer_replaces_object_subtree_when_it_is_smaller() {
         "unchanged": true,
     });
     let mut producer = Producer::new(initial);
-    producer
+    let mut inspector = Consumer::new();
+    let initial_message = producer
         .get_message()
         .expect("initial message should be encoded")
         .expect("initial snapshot should exist");
+    inspector
+        .consume(&initial_message)
+        .expect("inspector should accept the initial message");
 
     producer.update(json!({
         "wrapper": {"a": 1, "b": 1, "c": 1, "d": 1, "e": 1},
@@ -191,7 +255,9 @@ fn producer_replaces_object_subtree_when_it_is_smaller() {
         .expect("must have message to sync");
 
     assert_eq!(
-        Message::from_bytes(message).expect("producer message should decode"),
+        inspector
+            .decode_message_dry_run(&message)
+            .expect("producer message should decode"),
         Message::new(vec![Action::Replace {
             path: vec![PathSegment::Key("wrapper".to_string())],
             value: json!({"a": 1, "b": 1, "c": 1, "d": 1, "e": 1}),
@@ -211,10 +277,18 @@ fn copy_and_move_messages_round_trip() {
             path: vec![key("new")],
         },
     ]);
-    let move_bytes = message.to_bytes().expect("copy/move message should encode");
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let mut encode_txn = encode_pool.transaction();
+    let move_bytes = message
+        .to_bytes_with_pool_txn(&mut encode_txn)
+        .expect("copy/move message should encode");
+    encode_txn.commit();
+    let mut inspector = Consumer::new();
     assert_eq!(&move_bytes[..3], &[0xd9, 0xff, 0x01]);
     assert_eq!(
-        Message::from_bytes(move_bytes).expect("copy/move message should decode"),
+        inspector
+            .decode_message_dry_run(&move_bytes)
+            .expect("copy/move message should decode"),
         message
     );
 }
@@ -222,6 +296,8 @@ fn copy_and_move_messages_round_trip() {
 #[test]
 fn consumer_applies_copy_and_move_actions() {
     let mut consumer = Consumer::new();
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let mut encode_txn = encode_pool.transaction();
     let message = Message::new(vec![
         Action::Snapshot {
             value: json!({
@@ -239,8 +315,9 @@ fn consumer_applies_copy_and_move_actions() {
             path: vec![key("items"), PathSegment::Index(2)],
         },
     ])
-    .to_bytes()
+    .to_bytes_with_pool_txn(&mut encode_txn)
     .expect("copy/move message should encode");
+    encode_txn.commit();
 
     consumer
         .consume(&message)
@@ -268,10 +345,14 @@ fn producer_emits_copy_and_move_actions_for_reused_object_values() {
         "source": shared.clone(),
         "keep": true,
     }));
-    producer
+    let mut inspector = Consumer::new();
+    let initial_message = producer
         .get_message()
         .expect("initial message should encode")
         .expect("initial snapshot should exist");
+    inspector
+        .consume(&initial_message)
+        .expect("inspector should accept the initial message");
 
     producer.update(json!({
         "new": shared.clone(),
@@ -285,7 +366,9 @@ fn producer_emits_copy_and_move_actions_for_reused_object_values() {
         .expect("copy message should exist");
 
     assert_eq!(
-        Message::from_bytes(message).expect("producer message should decode"),
+        inspector
+            .decode_message_dry_run(&message)
+            .expect("producer message should decode"),
         Message::new(vec![
             Action::Move {
                 from: vec![key("old")],

@@ -1,13 +1,14 @@
 use serde_json::Value;
 
 use crate::error::{JsyncError, JsyncErrorKind};
-use crate::message::{Action, Message, PathSegment};
+use crate::message::{Action, ConsumerPathSegmentPool, Message, PathSegment};
 
 /// Consumes Jsync messages and maintains the current JSON document.
 #[derive(Debug, Default)]
 pub struct Consumer {
     document: Option<Value>,
     initialized: bool,
+    path_segment_pool: ConsumerPathSegmentPool,
 }
 
 impl Consumer {
@@ -21,9 +22,24 @@ impl Consumer {
         self.document.as_ref()
     }
 
+    /// Decodes one Jsync message without committing path segment pool changes.
+    ///
+    /// Very helpful for decoding and inspecting the message without modifying
+    /// the consumer's state (we ask for `&mut self` but we do not change it).
+    pub fn decode_message_dry_run(&mut self, message: &[u8]) -> Result<Message, JsyncError> {
+        let mut transaction = self.path_segment_pool.transaction();
+        let result = Message::from_bytes_with_pool_txn(message.to_vec(), &mut transaction);
+        transaction.abort();
+        result
+    }
+
     /// Decodes and atomically applies one Jsync message.
+    ///
+    /// If it fails, the state of the consumer will not be modified.
     pub fn consume(&mut self, message: &[u8]) -> Result<(), JsyncError> {
-        let actions = Message::from_bytes(message.to_vec())?.actions;
+        let mut transaction = self.path_segment_pool.transaction();
+        let message = Message::from_bytes_with_pool_txn(message.to_vec(), &mut transaction)?;
+        let actions = message.actions;
         if !self.initialized && !matches!(actions.first(), Some(Action::Snapshot { .. })) {
             return Err(JsyncError::new(
                 JsyncErrorKind::InitialSnapshotRequired,
@@ -33,15 +49,16 @@ impl Consumer {
 
         let mut working = self.document.clone().unwrap_or(Value::Null);
         for (index, action) in actions.into_iter().enumerate() {
-            apply_action(&mut working, action).map_err(|error| {
-                error
+            if let Err(error) = apply_action(&mut working, action) {
+                return Err(error
                     .with_metadata("action_index", index.to_string())
-                    .with_context("while applying a Jsync action")
-            })?;
+                    .with_context("while applying a Jsync action"));
+            }
         }
 
         self.document = Some(working);
         self.initialized = true;
+        transaction.commit();
         Ok(())
     }
 }

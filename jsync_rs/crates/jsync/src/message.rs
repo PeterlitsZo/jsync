@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use ciborium::Value as CborValue;
@@ -72,7 +73,7 @@ pub enum Action {
 }
 
 /// One segment in a validated Jsync action path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathSegment {
     /// Selects an object property by key.
     Key(String),
@@ -86,36 +87,198 @@ impl Message {
         Self { actions }
     }
 
-    /// Decodes and validates one complete Jsync binary message.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, JsyncError> {
-        let payload = decode_payload(&bytes)?;
-        Ok(Self {
-            actions: parse_actions(payload)?,
-        })
+    /// Decodes a message using a caller-owned consumer path segment pool transaction.
+    pub fn from_bytes_with_pool_txn(
+        bytes: Vec<u8>,
+        txn: &mut ConsumerPathSegmentPoolTransaction<'_>,
+    ) -> Result<Self, JsyncError> {
+        decode_payload(&bytes)
+            .and_then(|payload| parse_message(payload, txn))
+            .map(|actions| Self { actions })
     }
 
-    /// Encodes this message as Jsync version 1 bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, JsyncError> {
-        let payload = CborValue::Array(
-            self.actions
+    /// Encodes this message using a caller-owned producer path segment pool
+    /// transaction.
+    pub fn to_bytes_with_pool_txn(
+        &self,
+        txn: &mut ProducerPathSegmentPoolTransaction<'_>,
+    ) -> Result<Vec<u8>, JsyncError> {
+        // Encode the actions into CBOR. It will interact with the txn to append
+        // path segments as needed.
+        let actions = self
+            .actions
+            .iter()
+            .map(|action| action_to_cbor(action, txn))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Encode the metadata into CBOR (we get the appended segments from the
+        // txn).
+        let metadata = CborValue::Array(vec![CborValue::Array(
+            txn.appended_segments()
                 .iter()
-                .map(action_to_cbor)
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let mut bytes = HEADER.to_vec();
-        ciborium::ser::into_writer(&payload, &mut bytes).map_err(|error| {
-            JsyncError::new(
-                JsyncErrorKind::ApplyFailed,
-                "The Jsync message could not be encoded.",
-            )
-            .with_source(anyhow::Error::new(error))
-        })?;
-        Ok(bytes)
+                .map(|segment| match segment {
+                    PathSegment::Key(key) => CborValue::Text(key.clone()),
+                    PathSegment::Index(index) => integer(*index as u64),
+                })
+                .collect(),
+        )]);
+
+        // Encode the payload into CBOR.
+        let payload = CborValue::Array(vec![metadata, CborValue::Array(actions)]);
+
+        // Serialize the payload into bytes with the header.
+        {
+            let mut bytes = HEADER.to_vec();
+            ciborium::ser::into_writer(&payload, &mut bytes).map_err(|error| {
+                JsyncError::new(
+                    JsyncErrorKind::ApplyFailed,
+                    "The Jsync message could not be encoded.",
+                )
+                .with_source(anyhow::Error::new(error))
+            })?;
+            Ok(bytes)
+        }
+    }
+}
+
+/// Producer-side path segment pool with stable indexes and O(1) segment lookup.
+#[derive(Debug, Clone, Default)]
+pub struct ProducerPathSegmentPool {
+    segments: Vec<PathSegment>,
+    indexes: HashMap<PathSegment, usize>,
+}
+
+impl ProducerPathSegmentPool {
+    /// Creates an empty producer path segment pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts an atomic producer pool update.
+    pub fn transaction(&mut self) -> ProducerPathSegmentPoolTransaction<'_> {
+        let checkpoint = self.segments.len();
+        ProducerPathSegmentPoolTransaction {
+            pool: self,
+            checkpoint,
+            committed: false,
+        }
+    }
+
+    fn index_for(&mut self, segment: &PathSegment) -> usize {
+        if let Some(index) = self.indexes.get(segment) {
+            return *index;
+        }
+
+        let index = self.segments.len();
+        let segment = segment.clone();
+        self.segments.push(segment.clone());
+        self.indexes.insert(segment, index);
+        index
+    }
+
+    fn rollback_to(&mut self, len: usize) {
+        if len >= self.segments.len() {
+            return;
+        }
+
+        for segment in self.segments.drain(len..) {
+            self.indexes.remove(&segment);
+        }
+    }
+}
+
+/// Producer-side path segment pool transaction.
+#[derive(Debug)]
+pub struct ProducerPathSegmentPoolTransaction<'a> {
+    pool: &'a mut ProducerPathSegmentPool,
+    checkpoint: usize,
+    committed: bool,
+}
+
+impl ProducerPathSegmentPoolTransaction<'_> {
+    /// Returns the segments appended since this transaction started.
+    pub fn appended_segments(&self) -> &[PathSegment] {
+        &self.pool.segments[self.checkpoint..]
+    }
+
+    /// Commits this transaction.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Aborts this transaction and rolls the pool back to its checkpoint.
+    pub fn abort(self) {}
+}
+
+impl Drop for ProducerPathSegmentPoolTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.pool.rollback_to(self.checkpoint);
+        }
+    }
+}
+
+/// Consumer-side path segment pool with stable indexes.
+#[derive(Debug, Clone, Default)]
+pub struct ConsumerPathSegmentPool {
+    segments: Vec<PathSegment>,
+}
+
+impl ConsumerPathSegmentPool {
+    /// Creates an empty consumer path segment pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Starts an atomic consumer pool update.
+    pub fn transaction(&mut self) -> ConsumerPathSegmentPoolTransaction<'_> {
+        let checkpoint = self.segments.len();
+        ConsumerPathSegmentPoolTransaction {
+            pool: self,
+            checkpoint,
+            committed: false,
+        }
+    }
+
+    fn rollback_to(&mut self, len: usize) {
+        self.segments.truncate(len);
+    }
+}
+
+/// Consumer-side path segment pool transaction.
+#[derive(Debug)]
+pub struct ConsumerPathSegmentPoolTransaction<'a> {
+    pool: &'a mut ConsumerPathSegmentPool,
+    checkpoint: usize,
+    committed: bool,
+}
+
+impl ConsumerPathSegmentPoolTransaction<'_> {
+    /// Appends path segments declared by message metadata.
+    pub fn append_segments(&mut self, segments: Vec<PathSegment>) {
+        self.pool.segments.extend(segments);
+    }
+
+    /// Commits this transaction.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// Aborts this transaction and rolls the pool back to its checkpoint.
+    pub fn abort(self) {}
+}
+
+impl Drop for ConsumerPathSegmentPoolTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.pool.rollback_to(self.checkpoint);
+        }
     }
 }
 
 /// Decodes the one CBOR payload after validating and removing the Jsync header.
 fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
+    // Check the header and version.
     if message.get(..HEADER.len()) != Some(HEADER.as_slice()) {
         if message.len() >= 3 && message[0..2] == [0xd9, 0xff] && message[2] > 1 {
             return Err(JsyncError::new(
@@ -132,6 +295,7 @@ fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
         .with_metadata("expected", "0xd9ff01"));
     }
 
+    // Parse it as a CBOR value.
     let payload = &message[HEADER.len()..];
     let mut cursor = Cursor::new(payload);
     let value = ciborium::de::from_reader::<CborValue, _>(&mut cursor).map_err(|error| {
@@ -141,6 +305,8 @@ fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
         )
         .with_source(anyhow::Error::new(error))
     })?;
+
+    // Make sure there are no trailing bytes.
     if cursor.position() != payload.len() as u64 {
         return Err(JsyncError::new(
             JsyncErrorKind::TrailingBytes,
@@ -151,13 +317,18 @@ fn decode_payload(message: &[u8]) -> Result<CborValue, JsyncError> {
             (payload.len() as u64 - cursor.position()).to_string(),
         ));
     }
+
     Ok(value)
 }
 
 /// Validates and converts a decoded CBOR message into structured actions.
-fn parse_actions(value: CborValue) -> Result<Vec<Action>, JsyncError> {
-    let actions = match value {
-        CborValue::Array(actions) => actions,
+fn parse_message(
+    value: CborValue,
+    txn: &mut ConsumerPathSegmentPoolTransaction<'_>,
+) -> Result<Vec<Action>, JsyncError> {
+    // Check the schema of the message -- it must be an array with two elements.
+    let message = match value {
+        CborValue::Array(message) => message,
         _ => {
             return Err(JsyncError::new(
                 JsyncErrorKind::MessageNotArray,
@@ -165,22 +336,82 @@ fn parse_actions(value: CborValue) -> Result<Vec<Action>, JsyncError> {
             ));
         }
     };
+    if message.len() != 2 {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidActionLength,
+            "The Jsync message payload must contain metadata and actions.",
+        )
+        .with_metadata("expected", "2")
+        .with_metadata("actual", message.len().to_string()));
+    }
 
-    actions
+    // Parse the metadata and append the path segments in metadata to the path
+    // segment pool.
+    let mut elements = message.into_iter();
+    let to_append_path_segment_pool =
+        parse_metadata(elements.next().expect("validated message length"))?;
+    txn.append_segments(to_append_path_segment_pool);
+
+    // Parse the actions from the message payload.
+    let actions = match elements.next().expect("validated message length") {
+        CborValue::Array(actions) => actions,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::MessageNotArray,
+                "The Jsync actions payload must be an array.",
+            ));
+        }
+    };
+    let actions = actions
         .into_iter()
         .enumerate()
         .map(|(index, action)| {
-            parse_action(action).map_err(|error| {
+            parse_action(action, txn).map_err(|error| {
                 error
                     .with_metadata("action_index", index.to_string())
                     .with_context("while parsing a Jsync action")
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(actions)
+}
+
+fn parse_metadata(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
+    // Check the schema of the metadata.
+    let metadata = match value {
+        CborValue::Array(metadata) => metadata,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::MessageNotArray,
+                "The Jsync metadata must be an array.",
+            ));
+        }
+    };
+    if metadata.len() != 1 {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidActionLength,
+            "The Jsync metadata must contain the path segment pool append list.",
+        )
+        .with_metadata("expected", "1")
+        .with_metadata("actual", metadata.len().to_string()));
+    }
+
+    // Parse the path segments from the metadata.
+    parse_path_segments(
+        metadata
+            .into_iter()
+            .next()
+            .expect("validated metadata length"),
+    )
 }
 
 /// Validates one raw CBOR action without relying on its position in the message.
-fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
+fn parse_action(
+    value: CborValue,
+    txn: &ConsumerPathSegmentPoolTransaction<'_>,
+) -> Result<Action, JsyncError> {
+    // Check the schema of the action.
     let action = match value {
         CborValue::Array(action) => action,
         _ => {
@@ -199,6 +430,7 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
         .with_metadata("actual", "0"));
     }
 
+    // Parse the opcode from the action.
     let opcode = action
         .first()
         .and_then(CborValue::as_integer)
@@ -210,6 +442,7 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             )
         })?;
 
+    // Parse the action based on the opcode.
     match opcode {
         0 => {
             require_action_length(action.len(), 2)?;
@@ -226,7 +459,7 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             let mut elements = action.into_iter();
             let _opcode = elements.next();
             let raw_path = elements.next().expect("validated add length");
-            let path = parse_path(raw_path)
+            let path = parse_pooled_path_with_txn(raw_path, txn)
                 .map_err(|error| error.with_context("while parsing the ADD path"))?;
             let raw_value = elements.next().expect("validated add length");
             let value = to_json(raw_value)
@@ -237,16 +470,18 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             require_action_length(action.len(), 2)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let path = parse_path(elements.next().expect("validated remove length"))
-                .map_err(|error| error.with_context("while parsing the REMOVE path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated remove length"), txn)
+                    .map_err(|error| error.with_context("while parsing the REMOVE path"))?;
             Ok(Action::Remove { path })
         }
         3 => {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let path = parse_path(elements.next().expect("validated replace length"))
-                .map_err(|error| error.with_context("while parsing the REPLACE path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated replace length"), txn)
+                    .map_err(|error| error.with_context("while parsing the REPLACE path"))?;
             let value = to_json(elements.next().expect("validated replace length"))
                 .map_err(|error| error.with_context("while decoding the REPLACE value"))?;
             Ok(Action::Replace { path, value })
@@ -255,8 +490,9 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let path = parse_path(elements.next().expect("validated append length"))
-                .map_err(|error| error.with_context("while parsing the APPEND path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated append length"), txn)
+                    .map_err(|error| error.with_context("while parsing the APPEND path"))?;
             let text = parse_text(elements.next().expect("validated append length"))
                 .map_err(|error| error.with_context("while decoding the APPEND text"))?;
             Ok(Action::Append { path, text })
@@ -265,8 +501,9 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let path = parse_path(elements.next().expect("validated prepend length"))
-                .map_err(|error| error.with_context("while parsing the PREPEND path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated prepend length"), txn)
+                    .map_err(|error| error.with_context("while parsing the PREPEND path"))?;
             let text = parse_text(elements.next().expect("validated prepend length"))
                 .map_err(|error| error.with_context("while decoding the PREPEND text"))?;
             Ok(Action::Prepend { path, text })
@@ -275,20 +512,24 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let from = parse_path(elements.next().expect("validated copy length"))
-                .map_err(|error| error.with_context("while parsing the COPY from path"))?;
-            let path = parse_path(elements.next().expect("validated copy length"))
-                .map_err(|error| error.with_context("while parsing the COPY path"))?;
+            let from =
+                parse_pooled_path_with_txn(elements.next().expect("validated copy length"), txn)
+                    .map_err(|error| error.with_context("while parsing the COPY from path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated copy length"), txn)
+                    .map_err(|error| error.with_context("while parsing the COPY path"))?;
             Ok(Action::Copy { from, path })
         }
         7 => {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
             let _opcode = elements.next();
-            let from = parse_path(elements.next().expect("validated move length"))
-                .map_err(|error| error.with_context("while parsing the MOVE from path"))?;
-            let path = parse_path(elements.next().expect("validated move length"))
-                .map_err(|error| error.with_context("while parsing the MOVE path"))?;
+            let from =
+                parse_pooled_path_with_txn(elements.next().expect("validated move length"), txn)
+                    .map_err(|error| error.with_context("while parsing the MOVE from path"))?;
+            let path =
+                parse_pooled_path_with_txn(elements.next().expect("validated move length"), txn)
+                    .map_err(|error| error.with_context("while parsing the MOVE path"))?;
             Ok(Action::Move { from, path })
         }
         opcode => Err(JsyncError::new(
@@ -313,8 +554,8 @@ fn require_action_length(actual: usize, expected: usize) -> Result<(), JsyncErro
     }
 }
 
-/// Converts a raw CBOR path array into validated path segments.
-fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
+/// Converts raw path segment metadata into validated path segments.
+fn parse_path_segments(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
     let path = match value {
         CborValue::Array(path) => path,
         _ => {
@@ -356,52 +597,118 @@ fn parse_path(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
         .collect()
 }
 
-fn action_to_cbor(action: &Action) -> Result<CborValue, JsyncError> {
+/// Converts a raw CBOR path index array into validated path segments.
+fn parse_pooled_path_with_txn(
+    value: CborValue,
+    txn: &ConsumerPathSegmentPoolTransaction<'_>,
+) -> Result<Vec<PathSegment>, JsyncError> {
+    // Check the schema of the path.
+    let path = match value {
+        CborValue::Array(path) => path,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidPath,
+                "The path must be an array.",
+            ));
+        }
+    };
+
+    path.into_iter()
+        .enumerate()
+        .map(|(segment_index, segment)| {
+            // Parse and check the segment.
+            let CborValue::Integer(integer) = segment else {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "A path segment pool index must be a non-negative integer.",
+                )
+                .with_metadata("segment_index", segment_index.to_string()));
+            };
+            let integer = i128::from(integer);
+            if integer < 0 {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "A path segment pool index must be non-negative.",
+                )
+                .with_metadata("segment", integer.to_string())
+                .with_metadata("segment_index", segment_index.to_string()));
+            }
+            let index = usize::try_from(integer).map_err(|_| {
+                JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "A path segment pool index is too large.",
+                )
+                .with_metadata("segment", integer.to_string())
+                .with_metadata("segment_index", segment_index.to_string())
+            })?;
+
+            // Get the segment from the pool .
+            txn.pool.segments.get(index).cloned().ok_or_else(|| {
+                JsyncError::new(
+                    JsyncErrorKind::InvalidPath,
+                    "A path segment pool index is outside the current pool.",
+                )
+                .with_metadata("index", index.to_string())
+                .with_metadata("length", txn.pool.segments.len().to_string())
+                .with_metadata("segment_index", segment_index.to_string())
+            })
+        })
+        .collect()
+}
+
+fn action_to_cbor(
+    action: &Action,
+    txn: &mut ProducerPathSegmentPoolTransaction<'_>,
+) -> Result<CborValue, JsyncError> {
+    fn pooled_path_to_cbor(
+        txn: &mut ProducerPathSegmentPoolTransaction<'_>,
+        path: &[PathSegment],
+    ) -> CborValue {
+        CborValue::Array(
+            path.iter()
+                .map(|segment| txn.pool.index_for(segment))
+                .map(|index| integer(index as u64))
+                .collect(),
+        )
+    }
+
     match action {
         Action::Snapshot { value } => Ok(CborValue::Array(vec![integer(0), json_to_cbor(value)?])),
         Action::Add { path, value } => Ok(CborValue::Array(vec![
             integer(1),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, path),
             json_to_cbor(value)?,
         ])),
-        Action::Remove { path } => Ok(CborValue::Array(vec![integer(2), path_to_cbor(path)])),
+        Action::Remove { path } => Ok(CborValue::Array(vec![
+            integer(2),
+            pooled_path_to_cbor(txn, path),
+        ])),
         Action::Replace { path, value } => Ok(CborValue::Array(vec![
             integer(3),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, path),
             json_to_cbor(value)?,
         ])),
         Action::Append { path, text } => Ok(CborValue::Array(vec![
             integer(4),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, path),
             CborValue::Text(text.clone()),
         ])),
         Action::Prepend { path, text } => Ok(CborValue::Array(vec![
             integer(5),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, path),
             CborValue::Text(text.clone()),
         ])),
         Action::Copy { from, path } => Ok(CborValue::Array(vec![
             integer(6),
-            path_to_cbor(from),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, from),
+            pooled_path_to_cbor(txn, path),
         ])),
         Action::Move { from, path } => Ok(CborValue::Array(vec![
             integer(7),
-            path_to_cbor(from),
-            path_to_cbor(path),
+            pooled_path_to_cbor(txn, from),
+            pooled_path_to_cbor(txn, path),
         ])),
     }
-}
-
-fn path_to_cbor(path: &[PathSegment]) -> CborValue {
-    CborValue::Array(
-        path.iter()
-            .map(|segment| match segment {
-                PathSegment::Key(key) => CborValue::Text(key.clone()),
-                PathSegment::Index(index) => integer(*index as u64),
-            })
-            .collect(),
-    )
 }
 
 fn parse_text(value: CborValue) -> Result<String, JsyncError> {

@@ -1,5 +1,16 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, APPEND, COPY, MOVE, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import {
+  ADD,
+  APPEND,
+  ConsumerPathSegmentPool,
+  COPY,
+  MOVE,
+  Message,
+  PREPEND,
+  REMOVE,
+  REPLACE,
+  SNAPSHOT,
+} from './message.js';
 import { cloneJson, setOwn } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -8,42 +19,57 @@ import type { JsonObject, JsonValue } from './value.js';
 export class Consumer {
   #document: JsonValue | undefined;
   #initialized = false;
+  readonly #pathSegmentPool = new ConsumerPathSegmentPool();
 
   /** Returns the current document, or undefined before the first successful message. */
   get document(): JsonValue | undefined {
     return this.#document;
   }
 
+  /** Decodes one Jsync message without committing path segment pool changes. */
+  decodeMessageDryRun(message: Uint8Array | ArrayBuffer): Message {
+    return this.#pathSegmentPool.withTransaction((transaction) => {
+      try {
+        return Message.fromBytesWithPoolTxn(message, transaction);
+      } finally {
+        transaction.abort();
+      }
+    });
+  }
+
   /** Decodes and atomically applies one Jsync message. */
   consume(message: Uint8Array | ArrayBuffer): this {
-    let actions: Action[];
-    try {
-      actions = Message.fromBytes(message).actions;
-    } catch (error: unknown) {
-      throw ensureJsyncError(error).withContext('while consuming a Jsync message');
-    }
-
-    if (!this.#initialized && (actions.length === 0 || actions[0].type !== SNAPSHOT)) {
-      throw new JsyncError(
-        JsyncErrorKind.InitialSnapshotRequired,
-        'The first Jsync message must start with SNAPSHOT.',
-      );
-    }
-
-    let working = cloneJson(this.#document);
-    for (const [index, action] of actions.entries()) {
+    return this.#pathSegmentPool.withTransaction((transaction) => {
+      let actions: Action[];
       try {
-        working = applyAction(working, action);
+        actions = Message.fromBytesWithPoolTxn(message, transaction).actions;
       } catch (error: unknown) {
         throw ensureJsyncError(error)
-          .withMetadata('action_index', index)
-          .withContext('while applying a Jsync action');
+          .withContext('while consuming a Jsync message');
       }
-    }
 
-    this.#document = working;
-    this.#initialized = true;
-    return this;
+      if (!this.#initialized && (actions.length === 0 || actions[0].type !== SNAPSHOT)) {
+        throw new JsyncError(
+          JsyncErrorKind.InitialSnapshotRequired,
+          'The first Jsync message must start with SNAPSHOT.',
+        );
+      }
+
+      let working = cloneJson(this.#document);
+      for (const [index, action] of actions.entries()) {
+        try {
+          working = applyAction(working, action);
+        } catch (error: unknown) {
+          throw ensureJsyncError(error)
+            .withMetadata('action_index', index)
+            .withContext('while applying a Jsync action');
+        }
+      }
+
+      this.#document = working;
+      this.#initialized = true;
+      return this;
+    });
   }
 }
 
