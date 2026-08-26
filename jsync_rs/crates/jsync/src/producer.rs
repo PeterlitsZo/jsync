@@ -232,7 +232,7 @@ fn diff_objects(
     }
 
     // Return the plan.
-    Ok(plan(actions, path_segment_pool)?)
+    plan(actions, path_segment_pool)
 }
 
 fn child_path(path: &[PathSegment], key: &str) -> Vec<PathSegment> {
@@ -270,7 +270,7 @@ fn diff_arrays(
         });
     }
 
-    Ok(plan(actions, path_segment_pool)?)
+    plan(actions, path_segment_pool)
 }
 
 fn diff_strings(
@@ -282,33 +282,33 @@ fn diff_strings(
 ) -> Result<DiffPlan, JsyncError> {
     let mut best = replace;
 
-    if let Some(suffix) = new.strip_prefix(old) {
-        if !suffix.is_empty() {
-            let append = plan(
-                vec![Action::Append {
-                    path: path.to_vec(),
-                    text: suffix.to_string(),
-                }],
-                path_segment_pool,
-            )?;
-            if append.cost < best.cost {
-                best = append;
-            }
+    if let Some(suffix) = new.strip_prefix(old)
+        && !suffix.is_empty()
+    {
+        let append = plan(
+            vec![Action::Append {
+                path: path.to_vec(),
+                text: suffix.to_string(),
+            }],
+            path_segment_pool,
+        )?;
+        if append.cost < best.cost {
+            best = append;
         }
     }
 
-    if let Some(prefix) = new.strip_suffix(old) {
-        if !prefix.is_empty() {
-            let prepend = plan(
-                vec![Action::Prepend {
-                    path: path.to_vec(),
-                    text: prefix.to_string(),
-                }],
-                path_segment_pool,
-            )?;
-            if prepend.cost < best.cost {
-                best = prepend;
-            }
+    if let Some(prefix) = new.strip_suffix(old)
+        && !prefix.is_empty()
+    {
+        let prepend = plan(
+            vec![Action::Prepend {
+                path: path.to_vec(),
+                text: prefix.to_string(),
+            }],
+            path_segment_pool,
+        )?;
+        if prepend.cost < best.cost {
+            best = prepend;
         }
     }
 

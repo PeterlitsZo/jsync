@@ -21,6 +21,15 @@ export function normalizeJson(value: unknown): JsonValue {
         'A non-finite number is not allowed in JSON.',
       );
     }
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'The JSON integer is outside the cross-language safe integer range.',
+      )
+        .withMetadata('minimum', Number.MIN_SAFE_INTEGER)
+        .withMetadata('maximum', Number.MAX_SAFE_INTEGER)
+        .withMetadata('value', value);
+    }
     return value;
   }
   if (typeof value === 'bigint' || value === undefined) {
@@ -29,7 +38,10 @@ export function normalizeJson(value: unknown): JsonValue {
       'This CBOR value type is not allowed in JSON.',
     ).withMetadata('type', typeof value);
   }
-  if (Array.isArray(value)) return value.map(normalizeJson);
+  if (Array.isArray(value)) {
+    assertDenseArray(value);
+    return value.map(normalizeJson);
+  }
   if (value instanceof Map) {
     const object: JsonObject = {};
     for (const [key, item] of value as Map<unknown, unknown>) {
@@ -81,10 +93,24 @@ export function setOwn(object: JsonObject, key: string, value: JsonValue): void 
 /** Recursively clones a validated JSON value. */
 export function cloneJson(value: JsonValue | undefined): JsonValue | undefined {
   if (value === null || typeof value !== 'object' || value === undefined) return value;
-  if (Array.isArray(value)) return value.map(cloneJson) as JsonArray;
+  if (Array.isArray(value)) {
+    assertDenseArray(value);
+    return value.map(cloneJson) as JsonArray;
+  }
   const clone: JsonObject = {};
   for (const [key, child] of Object.entries(value)) {
     setOwn(clone, key, cloneJson(child) as JsonValue);
   }
   return clone;
+}
+
+function assertDenseArray(value: readonly unknown[]): void {
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index)) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'Sparse arrays are not valid JSON arrays.',
+      ).withMetadata('index', index);
+    }
+  }
 }

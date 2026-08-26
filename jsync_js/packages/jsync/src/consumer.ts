@@ -23,7 +23,7 @@ export class Consumer {
 
   /** Returns the current document, or undefined before the first successful message. */
   get document(): JsonValue | undefined {
-    return this.#document;
+    return cloneJson(this.#document);
   }
 
   /** Decodes one Jsync message without committing path segment pool changes. */

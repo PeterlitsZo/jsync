@@ -7,6 +7,7 @@ use serde_json::{Map, Number, Value};
 use crate::error::{JsyncError, JsyncErrorKind};
 
 const HEADER: [u8; 3] = [0xd9, 0xff, 0x01];
+const MAX_SAFE_JSON_INTEGER: i128 = 9_007_199_254_740_991;
 
 /// A structured Jsync message.
 #[derive(Debug, Clone, PartialEq)]
@@ -726,7 +727,9 @@ fn to_json(value: CborValue) -> Result<Value, JsyncError> {
         CborValue::Null => Ok(Value::Null),
         CborValue::Bool(value) => Ok(Value::Bool(value)),
         CborValue::Integer(integer) => {
-            let text = i128::from(integer).to_string();
+            let integer = i128::from(integer);
+            validate_safe_json_integer(integer)?;
+            let text = integer.to_string();
             serde_json::from_str(&text).map_err(|error| {
                 JsyncError::new(
                     JsyncErrorKind::InvalidJsonValue,
@@ -736,6 +739,7 @@ fn to_json(value: CborValue) -> Result<Value, JsyncError> {
             })
         }
         CborValue::Float(value) if value.is_finite() => {
+            validate_safe_json_float(value)?;
             Number::from_f64(value).map(Value::Number).ok_or_else(|| {
                 JsyncError::new(
                     JsyncErrorKind::InvalidJsonValue,
@@ -804,9 +808,11 @@ fn json_to_cbor(value: &Value) -> Result<CborValue, JsyncError> {
 
 fn number_to_cbor(number: &Number) -> Result<CborValue, JsyncError> {
     if let Some(value) = number.as_i64() {
+        validate_safe_json_integer(value as i128)?;
         return Ok(integer(value));
     }
     if let Some(value) = number.as_u64() {
+        validate_safe_json_integer(value as i128)?;
         return Ok(integer(value));
     }
 
@@ -818,6 +824,7 @@ fn number_to_cbor(number: &Number) -> Result<CborValue, JsyncError> {
         ));
     }
     if let Some(value) = number.as_f64() {
+        validate_safe_json_float(value)?;
         return Ok(CborValue::Float(value));
     }
 
@@ -825,6 +832,34 @@ fn number_to_cbor(number: &Number) -> Result<CborValue, JsyncError> {
         JsyncErrorKind::InvalidJsonValue,
         "The JSON number cannot be encoded as a CBOR number.",
     ))
+}
+
+fn validate_safe_json_integer(value: i128) -> Result<(), JsyncError> {
+    if (-MAX_SAFE_JSON_INTEGER..=MAX_SAFE_JSON_INTEGER).contains(&value) {
+        Ok(())
+    } else {
+        Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The JSON integer is outside the cross-language safe integer range.",
+        )
+        .with_metadata("minimum", (-MAX_SAFE_JSON_INTEGER).to_string())
+        .with_metadata("maximum", MAX_SAFE_JSON_INTEGER.to_string())
+        .with_metadata("value", value.to_string()))
+    }
+}
+
+fn validate_safe_json_float(value: f64) -> Result<(), JsyncError> {
+    if value.fract() != 0.0 || value.abs() <= MAX_SAFE_JSON_INTEGER as f64 {
+        Ok(())
+    } else {
+        Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The JSON integer is outside the cross-language safe integer range.",
+        )
+        .with_metadata("minimum", (-MAX_SAFE_JSON_INTEGER).to_string())
+        .with_metadata("maximum", MAX_SAFE_JSON_INTEGER.to_string())
+        .with_metadata("value", value.to_string()))
+    }
 }
 
 fn integer<T>(value: T) -> CborValue
