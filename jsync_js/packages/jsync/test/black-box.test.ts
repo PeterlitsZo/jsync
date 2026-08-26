@@ -1,18 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  ADD,
-  APPEND,
   Consumer,
-  COPY,
   Message,
-  MOVE,
-  PREPEND,
+  OPCODE_ADD,
+  OPCODE_COPY,
+  OPCODE_MOVE,
+  OPCODE_REMOVE,
+  OPCODE_REPLACE,
+  OPCODE_SNAPSHOT,
+  OPCODE_STRING_APPEND,
+  OPCODE_STRING_PREPEND,
   Producer,
   ProducerPathSegmentPool,
-  REMOVE,
-  REPLACE,
-  SNAPSHOT,
 } from '../src/index.js';
 import type { Action } from '../src/index.js';
 import type { JsonValue } from '../src/index.js';
@@ -33,9 +33,9 @@ test('producer messages keep consumer in sync', () => {
         obsolete: 'remove me',
       },
       new Message([
-        { type: ADD, path: ['items', 2], value: 'gamma' },
-        { type: APPEND, path: ['profile', 'name'], text: ' Lovelace' },
-        { type: REPLACE, path: ['revision'], value: 1 },
+        { type: OPCODE_ADD, path: ['items', 2], value: 'gamma' },
+        { type: OPCODE_STRING_APPEND, path: ['profile', 'name'], text: ' Lovelace' },
+        { type: OPCODE_REPLACE, path: ['revision'], value: 1 },
       ]),
     ],
     [
@@ -46,11 +46,11 @@ test('producer messages keep consumer in sync', () => {
         tags: ['math', 'programming'],
       },
       new Message([
-        { type: REMOVE, path: ['obsolete'] },
-        { type: REPLACE, path: ['profile', 'active'], value: false },
-        { type: PREPEND, path: ['profile', 'name'], text: 'Countess ' },
-        { type: REPLACE, path: ['revision'], value: 2 },
-        { type: ADD, path: ['tags'], value: ['math', 'programming'] },
+        { type: OPCODE_REMOVE, path: ['obsolete'] },
+        { type: OPCODE_REPLACE, path: ['profile', 'active'], value: false },
+        { type: OPCODE_STRING_PREPEND, path: ['profile', 'name'], text: 'Countess ' },
+        { type: OPCODE_REPLACE, path: ['revision'], value: 2 },
+        { type: OPCODE_ADD, path: ['tags'], value: ['math', 'programming'] },
       ]),
     ],
     [
@@ -61,15 +61,15 @@ test('producer messages keep consumer in sync', () => {
         tags: ['math'],
       },
       new Message([
-        { type: REPLACE, path: ['items'], value: ['gamma'] },
-        { type: REPLACE, path: ['revision'], value: 3 },
-        { type: REMOVE, path: ['tags', 1] },
+        { type: OPCODE_REPLACE, path: ['items'], value: ['gamma'] },
+        { type: OPCODE_REPLACE, path: ['revision'], value: 3 },
+        { type: OPCODE_REMOVE, path: ['tags', 1] },
       ]),
     ],
     [
       ['root replacement', { revision: 4 }, [1, 2, 3]],
       new Message([
-        { type: REPLACE, path: [], value: ['root replacement', { revision: 4 }, [1, 2, 3]] },
+        { type: OPCODE_REPLACE, path: [], value: ['root replacement', { revision: 4 }, [1, 2, 3]] },
       ]),
     ],
     [
@@ -81,7 +81,7 @@ test('producer messages keep consumer in sync', () => {
       },
       new Message([
         {
-          type: REPLACE,
+          type: OPCODE_REPLACE,
           path: [],
           value: {
             revision: 5,
@@ -102,7 +102,7 @@ test('producer messages keep consumer in sync', () => {
   assert.ok(initialMessage);
   assert.deepEqual(
     inspector.decodeMessageDryRun(initialMessage),
-    new Message([{ type: SNAPSHOT, value: initial } satisfies Action]),
+    new Message([{ type: OPCODE_SNAPSHOT, value: initial } satisfies Action]),
   );
   inspector.consume(initialMessage);
   consumer.consume(initialMessage);
@@ -132,7 +132,7 @@ test('producer replaces object subtree when it is smaller', () => {
     inspector.decodeMessageDryRun(initialMessage),
     new Message([
       {
-        type: SNAPSHOT,
+        type: OPCODE_SNAPSHOT,
         value: {
           wrapper: { a: 0, b: 0, c: 0, d: 0, e: 0 },
           unchanged: true,
@@ -151,14 +151,14 @@ test('producer replaces object subtree when it is smaller', () => {
 
   assert.deepEqual(
     inspector.decodeMessageDryRun(message),
-    new Message([{ type: REPLACE, path: ['wrapper'], value: { a: 1, b: 1, c: 1, d: 1, e: 1 } }]),
+    new Message([{ type: OPCODE_REPLACE, path: ['wrapper'], value: { a: 1, b: 1, c: 1, d: 1, e: 1 } }]),
   );
 });
 
 test('copy and move messages round trip', () => {
   const message = new Message([
-    { type: COPY, from: ['source'], path: ['target'] },
-    { type: MOVE, from: ['old'], path: ['new'] },
+    { type: OPCODE_COPY, from: ['source'], path: ['target'] },
+    { type: OPCODE_MOVE, from: ['old'], path: ['new'] },
   ]);
   const encodePool = new ProducerPathSegmentPool();
   const inspector = new Consumer();
@@ -176,15 +176,15 @@ test('consumer applies copy and move actions', () => {
   const message = encodePool.withTransaction((transaction) => (
     new Message([
       {
-        type: SNAPSHOT,
+        type: OPCODE_SNAPSHOT,
         value: {
           source: { nested: [1, 2] },
           items: ['a', 'b', 'c'],
           keep: true,
         },
       },
-      { type: COPY, from: ['source'], path: ['target'] },
-      { type: MOVE, from: ['items', 0], path: ['items', 2] },
+      { type: OPCODE_COPY, from: ['source'], path: ['target'] },
+      { type: OPCODE_MOVE, from: ['items', 0], path: ['items', 2] },
     ]).toBytesWithPoolTxn(transaction)
   ));
   consumer.consume(
@@ -218,8 +218,8 @@ test('producer emits copy and move actions for reused object values', () => {
   assert.deepEqual(
     inspector.decodeMessageDryRun(message),
     new Message([
-      { type: MOVE, from: ['old'], path: ['new'] },
-      { type: COPY, from: ['source'], path: ['target'] },
+      { type: OPCODE_MOVE, from: ['old'], path: ['new'] },
+      { type: OPCODE_COPY, from: ['source'], path: ['target'] },
     ]),
   );
 });

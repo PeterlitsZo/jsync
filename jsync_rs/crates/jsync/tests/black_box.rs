@@ -29,7 +29,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     path: vec![PathSegment::Key("items".to_string()), PathSegment::Index(2)],
                     value: json!("gamma"),
                 },
-                Action::Append {
+                Action::StringAppend {
                     path: vec![
                         PathSegment::Key("profile".to_string()),
                         PathSegment::Key("name".to_string()),
@@ -61,7 +61,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     ],
                     value: json!(false),
                 },
-                Action::Prepend {
+                Action::StringPrepend {
                     path: vec![
                         PathSegment::Key("profile".to_string()),
                         PathSegment::Key("name".to_string()),
@@ -168,7 +168,7 @@ fn producer_messages_keep_consumer_in_sync() {
                 "tags": ["person", "male"],
             }),
             expected_message: Message::new(vec![
-                Action::Append {
+                Action::StringAppend {
                     path: vec![
                         PathSegment::Key("profile".to_string()),
                         PathSegment::Key("name".to_string()),

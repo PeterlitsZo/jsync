@@ -7,6 +7,10 @@ use crate::error::{JsyncError, JsyncErrorKind};
 #[cfg(debug_assertions)]
 use crate::message::Message;
 use crate::message::{Action, PathSegment, ProducerPathSegmentPool};
+use crate::message::{
+    OPCODE_ADD, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE, OPCODE_SNAPSHOT,
+    OPCODE_STRING_APPEND, OPCODE_STRING_PREPEND,
+};
 
 pub(super) fn plan(
     actions: Vec<Action>,
@@ -88,34 +92,34 @@ impl<'a> CostEstimator<'a> {
 
     fn estimate_action(&mut self, action: &Action) -> Result<usize, JsyncError> {
         match action {
-            Action::Snapshot { value } => {
-                Ok(cbor_array_header_len(2) + cbor_uint_len(0) + estimate_json_value_len(value)?)
-            }
+            Action::Snapshot { value } => Ok(cbor_array_header_len(2)
+                + cbor_uint_len(OPCODE_SNAPSHOT)
+                + estimate_json_value_len(value)?),
             Action::Add { path, value } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(1)
+                + cbor_uint_len(OPCODE_ADD)
                 + self.estimate_path_len(path)
                 + estimate_json_value_len(value)?),
-            Action::Remove { path } => {
-                Ok(cbor_array_header_len(2) + cbor_uint_len(2) + self.estimate_path_len(path))
-            }
+            Action::Remove { path } => Ok(cbor_array_header_len(2)
+                + cbor_uint_len(OPCODE_REMOVE)
+                + self.estimate_path_len(path)),
             Action::Replace { path, value } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(3)
+                + cbor_uint_len(OPCODE_REPLACE)
                 + self.estimate_path_len(path)
                 + estimate_json_value_len(value)?),
-            Action::Append { path, text } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(4)
+            Action::StringAppend { path, text } => Ok(cbor_array_header_len(3)
+                + cbor_uint_len(OPCODE_STRING_APPEND)
                 + self.estimate_path_len(path)
                 + cbor_text_len(text)),
-            Action::Prepend { path, text } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(5)
+            Action::StringPrepend { path, text } => Ok(cbor_array_header_len(3)
+                + cbor_uint_len(OPCODE_STRING_PREPEND)
                 + self.estimate_path_len(path)
                 + cbor_text_len(text)),
             Action::Copy { from, path } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(6)
+                + cbor_uint_len(OPCODE_COPY)
                 + self.estimate_path_len(from)
                 + self.estimate_path_len(path)),
             Action::Move { from, path } => Ok(cbor_array_header_len(3)
-                + cbor_uint_len(7)
+                + cbor_uint_len(OPCODE_MOVE)
                 + self.estimate_path_len(from)
                 + self.estimate_path_len(path)),
         }

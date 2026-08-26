@@ -1,13 +1,13 @@
 import { JsyncError, JsyncErrorKind } from '../error.js';
 import {
-  ADD,
-  APPEND,
   Message,
-  PREPEND,
+  OPCODE_ADD,
+  OPCODE_REMOVE,
+  OPCODE_REPLACE,
+  OPCODE_SNAPSHOT,
+  OPCODE_STRING_APPEND,
+  OPCODE_STRING_PREPEND,
   ProducerPathSegmentPool,
-  REMOVE,
-  REPLACE,
-  SNAPSHOT,
 } from '../message.js';
 import type { Action, PathSegment } from '../message.js';
 import type { JsonValue } from '../value.js';
@@ -78,29 +78,29 @@ class CostEstimator {
   }
 
   estimateAction(action: Action): number {
-    if (action.type === SNAPSHOT) {
+    if (action.type === OPCODE_SNAPSHOT) {
       return cborArrayHeaderLength(2)
-        + cborUnsignedIntegerLength(SNAPSHOT)
+        + cborUnsignedIntegerLength(OPCODE_SNAPSHOT)
         + estimateJsonValueLength(action.value);
     }
-    if (action.type === ADD) {
+    if (action.type === OPCODE_ADD) {
       return cborArrayHeaderLength(3)
-        + cborUnsignedIntegerLength(ADD)
+        + cborUnsignedIntegerLength(OPCODE_ADD)
         + this.estimatePathLength(action.path)
         + estimateJsonValueLength(action.value);
     }
-    if (action.type === REMOVE) {
+    if (action.type === OPCODE_REMOVE) {
       return cborArrayHeaderLength(2)
-        + cborUnsignedIntegerLength(REMOVE)
+        + cborUnsignedIntegerLength(OPCODE_REMOVE)
         + this.estimatePathLength(action.path);
     }
-    if (action.type === REPLACE) {
+    if (action.type === OPCODE_REPLACE) {
       return cborArrayHeaderLength(3)
-        + cborUnsignedIntegerLength(REPLACE)
+        + cborUnsignedIntegerLength(OPCODE_REPLACE)
         + this.estimatePathLength(action.path)
         + estimateJsonValueLength(action.value);
     }
-    if (action.type === APPEND || action.type === PREPEND) {
+    if (action.type === OPCODE_STRING_APPEND || action.type === OPCODE_STRING_PREPEND) {
       return cborArrayHeaderLength(3)
         + cborUnsignedIntegerLength(action.type)
         + this.estimatePathLength(action.path)

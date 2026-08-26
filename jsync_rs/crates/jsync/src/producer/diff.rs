@@ -324,7 +324,7 @@ fn diff_strings(
         && !suffix.is_empty()
     {
         let append = plan(
-            vec![Action::Append {
+            vec![Action::StringAppend {
                 path: path.to_vec(),
                 text: suffix.to_string(),
             }],
@@ -339,7 +339,7 @@ fn diff_strings(
         && !prefix.is_empty()
     {
         let prepend = plan(
-            vec![Action::Prepend {
+            vec![Action::StringPrepend {
                 path: path.to_vec(),
                 text: prefix.to_string(),
             }],

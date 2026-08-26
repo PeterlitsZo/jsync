@@ -73,8 +73,8 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
         Action::Add { path, value } => apply_add(root, &path, value),
         Action::Remove { path } => apply_remove(root, &path),
         Action::Replace { path, value } => apply_replace(root, &path, value),
-        Action::Append { path, text } => apply_append(root, &path, &text),
-        Action::Prepend { path, text } => apply_prepend(root, &path, &text),
+        Action::StringAppend { path, text } => apply_string_append(root, &path, &text),
+        Action::StringPrepend { path, text } => apply_string_prepend(root, &path, &text),
         Action::Copy { from, path } => apply_copy(root, &from, &path),
         Action::Move { from, path } => apply_move(root, &from, &path),
     }
@@ -268,7 +268,11 @@ fn apply_replace(root: &mut Value, path: &[PathSegment], value: Value) -> Result
 }
 
 /// Appends text to an existing string at an object, array, or root path.
-fn apply_append(root: &mut Value, path: &[PathSegment], text: &str) -> Result<(), JsyncError> {
+fn apply_string_append(
+    root: &mut Value,
+    path: &[PathSegment],
+    text: &str,
+) -> Result<(), JsyncError> {
     let target = resolve_value(root, path)
         .map_err(|error| error.with_context("while resolving an APPEND path target"))?;
     let Value::String(target) = target else {
@@ -283,7 +287,11 @@ fn apply_append(root: &mut Value, path: &[PathSegment], text: &str) -> Result<()
 }
 
 /// Prepends text to an existing string at an object, array, or root path.
-fn apply_prepend(root: &mut Value, path: &[PathSegment], text: &str) -> Result<(), JsyncError> {
+fn apply_string_prepend(
+    root: &mut Value,
+    path: &[PathSegment],
+    text: &str,
+) -> Result<(), JsyncError> {
     let target = resolve_value(root, path)
         .map_err(|error| error.with_context("while resolving a PREPEND path target"))?;
     let Value::String(target) = target else {

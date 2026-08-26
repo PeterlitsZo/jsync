@@ -1,15 +1,15 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from './error.js';
 import {
-  ADD,
-  APPEND,
   ConsumerPathSegmentPool,
-  COPY,
-  MOVE,
   Message,
-  PREPEND,
-  REMOVE,
-  REPLACE,
-  SNAPSHOT,
+  OPCODE_ADD,
+  OPCODE_COPY,
+  OPCODE_MOVE,
+  OPCODE_REMOVE,
+  OPCODE_REPLACE,
+  OPCODE_SNAPSHOT,
+  OPCODE_STRING_APPEND,
+  OPCODE_STRING_PREPEND,
 } from './message.js';
 import { cloneJson, setOwn } from './value.js';
 import type { Action, PathSegment } from './message.js';
@@ -48,7 +48,7 @@ export class Consumer {
           .withContext('while consuming a Jsync message');
       }
 
-      if (!this.#initialized && (actions.length === 0 || actions[0].type !== SNAPSHOT)) {
+      if (!this.#initialized && (actions.length === 0 || actions[0].type !== OPCODE_SNAPSHOT)) {
         throw new JsyncError(
           JsyncErrorKind.InitialSnapshotRequired,
           'The first Jsync message must start with SNAPSHOT.',
@@ -75,16 +75,22 @@ export class Consumer {
 
 /** Applies one validated action to a working document. */
 function applyAction(root: JsonValue | undefined, action: Action): JsonValue {
-  if (action.type === SNAPSHOT) return cloneJson(action.value) as JsonValue;
-  if (action.type === ADD) return applyAdd(root, action.path, cloneJson(action.value) as JsonValue);
-  if (action.type === REMOVE) return applyRemove(root, action.path);
-  if (action.type === REPLACE) {
+  if (action.type === OPCODE_SNAPSHOT) return cloneJson(action.value) as JsonValue;
+  if (action.type === OPCODE_ADD) {
+    return applyAdd(root, action.path, cloneJson(action.value) as JsonValue);
+  }
+  if (action.type === OPCODE_REMOVE) return applyRemove(root, action.path);
+  if (action.type === OPCODE_REPLACE) {
     return applyReplace(root, action.path, cloneJson(action.value) as JsonValue);
   }
-  if (action.type === APPEND) return applyAppend(root, action.path, action.text);
-  if (action.type === PREPEND) return applyPrepend(root, action.path, action.text);
-  if (action.type === COPY) return applyCopy(root, action.from, action.path);
-  if (action.type === MOVE) return applyMove(root, action.from, action.path);
+  if (action.type === OPCODE_STRING_APPEND) {
+    return applyStringAppend(root, action.path, action.text);
+  }
+  if (action.type === OPCODE_STRING_PREPEND) {
+    return applyStringPrepend(root, action.path, action.text);
+  }
+  if (action.type === OPCODE_COPY) return applyCopy(root, action.from, action.path);
+  if (action.type === OPCODE_MOVE) return applyMove(root, action.from, action.path);
   throw new JsyncError(JsyncErrorKind.ApplyFailed, 'The Jsync action type is not supported.');
 }
 
@@ -282,7 +288,7 @@ function applyReplace(
 }
 
 /** Appends text to an existing string value. */
-function applyAppend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
+function applyStringAppend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
   if (path.length === 0) {
     if (typeof root !== 'string') {
       throw new JsyncError(
@@ -305,7 +311,7 @@ function applyAppend(root: JsonValue | undefined, path: PathSegment[], text: str
 }
 
 /** Prepends text to an existing string value. */
-function applyPrepend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
+function applyStringPrepend(root: JsonValue | undefined, path: PathSegment[], text: string): JsonValue {
   if (path.length === 0) {
     if (typeof root !== 'string') {
       throw new JsyncError(

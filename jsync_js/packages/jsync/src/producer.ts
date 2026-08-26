@@ -1,5 +1,5 @@
 import { JsyncError, JsyncErrorKind } from './error.js';
-import { Message, ProducerPathSegmentPool, SNAPSHOT } from './message.js';
+import { Message, OPCODE_SNAPSHOT, ProducerPathSegmentPool } from './message.js';
 import { buildDiff, deepEqual } from './producer/diff.js';
 import { cloneJson, normalizeJson } from './value.js';
 import type { Action } from './message.js';
@@ -30,7 +30,7 @@ export class Producer {
   getMessage(): Uint8Array | undefined {
     let actions: Action[];
     if (this.#lastEmittedDocument === undefined) {
-      actions = [{ type: SNAPSHOT, value: cloneJson(this.#document) as JsonValue }];
+      actions = [{ type: OPCODE_SNAPSHOT, value: cloneJson(this.#document) as JsonValue }];
     } else if (deepEqual(this.#lastEmittedDocument, this.#document)) {
       return undefined;
     } else {

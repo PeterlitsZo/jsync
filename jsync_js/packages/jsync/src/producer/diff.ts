@@ -1,12 +1,12 @@
 import {
-  ADD,
-  APPEND,
-  COPY,
-  MOVE,
-  PREPEND,
+  OPCODE_ADD,
+  OPCODE_COPY,
+  OPCODE_MOVE,
+  OPCODE_REMOVE,
+  OPCODE_REPLACE,
+  OPCODE_STRING_APPEND,
+  OPCODE_STRING_PREPEND,
   ProducerPathSegmentPool,
-  REMOVE,
-  REPLACE,
 } from '../message.js';
 import { cloneJson } from '../value.js';
 import { plan } from './cost.js';
@@ -68,7 +68,7 @@ function diffObjects(
 
   actions.push(...moveActions);
   for (const key of remainingRemoved) {
-    actions.push({ type: REMOVE, path: [...path, key] });
+    actions.push({ type: OPCODE_REMOVE, path: [...path, key] });
   }
 
   const common = sortedCommonKeys(old, next);
@@ -91,7 +91,7 @@ function diffObjects(
 
   for (const key of remainingAdded) {
     actions.push({
-      type: ADD,
+      type: OPCODE_ADD,
       path: [...path, key],
       value: cloneJson(next[key]) as JsonValue,
     });
@@ -168,13 +168,13 @@ function extractMoveActions(
     }
 
     const moveAction: Action = {
-      type: MOVE,
+      type: OPCODE_MOVE,
       from: childPath(path, key),
       path: childPath(path, addedKey),
     };
     const fallback: Action[] = [
-      { type: REMOVE, path: childPath(path, key) },
-      { type: ADD, path: childPath(path, addedKey), value: cloneJson(next[addedKey]) as JsonValue },
+      { type: OPCODE_REMOVE, path: childPath(path, key) },
+      { type: OPCODE_ADD, path: childPath(path, addedKey), value: cloneJson(next[addedKey]) as JsonValue },
     ];
     if (plan([moveAction], pathSegmentPool).cost < plan(fallback, pathSegmentPool).cost) {
       removeSortedKey(added, addedKey);
@@ -206,12 +206,12 @@ function extractCopyActions(
     }
 
     const copyAction: Action = {
-      type: COPY,
+      type: OPCODE_COPY,
       from: childPath(path, source),
       path: childPath(path, key),
     };
     const fallback: Action = {
-      type: ADD,
+      type: OPCODE_ADD,
       path: childPath(path, key),
       value: cloneJson(next[key]) as JsonValue,
     };
@@ -258,12 +258,12 @@ function diffArrays(
   }
 
   for (let index = old.length - 1; index >= next.length; index -= 1) {
-    actions.push({ type: REMOVE, path: [...path, index] });
+    actions.push({ type: OPCODE_REMOVE, path: [...path, index] });
   }
 
   for (let index = old.length; index < next.length; index += 1) {
     actions.push({
-      type: ADD,
+      type: OPCODE_ADD,
       path: [...path, index],
       value: cloneJson(next[index]) as JsonValue,
     });
@@ -285,7 +285,7 @@ function diffStrings(
     const suffix = next.slice(old.length);
     if (suffix.length > 0) {
       const append = plan(
-        [{ type: APPEND, path: [...path], text: suffix }],
+        [{ type: OPCODE_STRING_APPEND, path: [...path], text: suffix }],
         pathSegmentPool,
       );
       if (append.cost < best.cost) best = append;
@@ -296,7 +296,7 @@ function diffStrings(
     const prefix = next.slice(0, next.length - old.length);
     if (prefix.length > 0) {
       const prepend = plan(
-        [{ type: PREPEND, path: [...path], text: prefix }],
+        [{ type: OPCODE_STRING_PREPEND, path: [...path], text: prefix }],
         pathSegmentPool,
       );
       if (prepend.cost < best.cost) best = prepend;
@@ -312,7 +312,7 @@ function replacePlan(
   pathSegmentPool: ProducerPathSegmentPool,
 ): DiffPlan {
   return plan(
-    [{ type: REPLACE, path: [...path], value: cloneJson(value) as JsonValue }],
+    [{ type: OPCODE_REPLACE, path: [...path], value: cloneJson(value) as JsonValue }],
     pathSegmentPool,
   );
 }
