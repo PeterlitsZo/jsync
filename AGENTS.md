@@ -8,6 +8,11 @@ server. It supports multipie languages:
 - `jsync_rs`: Support Rust.
 - `jsonc_js`: Support JavaScript.
 
+## You behavior
+
+- DO NOT touch the documents UNTIL user ask you to do so.
+- DO NOT add tests UNTIL user asks you to do so.
+
 ## When You Need to Commit
 
 WHEN THE USER ASKS YOU TO COMMIT, you MUST follow this section.

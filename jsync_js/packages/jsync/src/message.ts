@@ -17,6 +17,10 @@ export const REPLACE = 3;
 export const APPEND = 4;
 /** The PREPEND action opcode. */
 export const PREPEND = 5;
+/** The COPY action opcode. */
+export const COPY = 6;
+/** The MOVE action opcode. */
+export const MOVE = 7;
 
 /** A validated action path segment. */
 export type PathSegment = string | number;
@@ -61,6 +65,20 @@ export interface PrependAction {
   readonly text: string;
 }
 
+/** A validated COPY action. */
+export interface CopyAction {
+  readonly type: typeof COPY;
+  readonly from: PathSegment[];
+  readonly path: PathSegment[];
+}
+
+/** A validated MOVE action. */
+export interface MoveAction {
+  readonly type: typeof MOVE;
+  readonly from: PathSegment[];
+  readonly path: PathSegment[];
+}
+
 /** A validated Jsync action. */
 export type Action =
   | SnapshotAction
@@ -68,7 +86,9 @@ export type Action =
   | RemoveAction
   | ReplaceAction
   | AppendAction
-  | PrependAction;
+  | PrependAction
+  | CopyAction
+  | MoveAction;
 
 const decoder = new Decoder({ mapsAsObjects: false, useRecords: false });
 const encoder = new Encoder({ mapsAsObjects: false, useRecords: false });
@@ -293,6 +313,38 @@ function parseAction(value: unknown): Action {
     }
     return { type: PREPEND, path, text };
   }
+  if (opcode === COPY) {
+    requireActionLength(value.length, 3);
+    let from: PathSegment[];
+    try {
+      from = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the COPY from path');
+    }
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the COPY path');
+    }
+    return { type: COPY, from, path };
+  }
+  if (opcode === MOVE) {
+    requireActionLength(value.length, 3);
+    let from: PathSegment[];
+    try {
+      from = parsePath(value[1]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the MOVE from path');
+    }
+    let path: PathSegment[];
+    try {
+      path = parsePath(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the MOVE path');
+    }
+    return { type: MOVE, from, path };
+  }
   throw new JsyncError(
     JsyncErrorKind.UnknownAction,
     'The Jsync action opcode is not supported.',
@@ -373,6 +425,20 @@ function normalizeAction(action: Action): Action {
       text: parseText(action.text),
     };
   }
+  if (action.type === COPY) {
+    return {
+      type: COPY,
+      from: parsePath(action.from),
+      path: parsePath(action.path),
+    };
+  }
+  if (action.type === MOVE) {
+    return {
+      type: MOVE,
+      from: parsePath(action.from),
+      path: parsePath(action.path),
+    };
+  }
   throw new JsyncError(
     JsyncErrorKind.UnknownAction,
     'The Jsync action type is not supported.',
@@ -396,5 +462,8 @@ function encodeAction(action: Action): unknown[] {
   if (action.type === REPLACE) {
     return [REPLACE, [...action.path], cloneJson(action.value)];
   }
-  return [action.type, [...action.path], action.text];
+  if (action.type === APPEND || action.type === PREPEND) {
+    return [action.type, [...action.path], action.text];
+  }
+  return [action.type, [...action.from], [...action.path]];
 }

@@ -1,5 +1,5 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, APPEND, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { ADD, APPEND, COPY, MOVE, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
 import { cloneJson, setOwn } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -57,6 +57,8 @@ function applyAction(root: JsonValue | undefined, action: Action): JsonValue {
   }
   if (action.type === APPEND) return applyAppend(root, action.path, action.text);
   if (action.type === PREPEND) return applyPrepend(root, action.path, action.text);
+  if (action.type === COPY) return applyCopy(root, action.from, action.path);
+  if (action.type === MOVE) return applyMove(root, action.from, action.path);
   throw new JsyncError(JsyncErrorKind.ApplyFailed, 'The Jsync action type is not supported.');
 }
 
@@ -299,11 +301,170 @@ function applyPrepend(root: JsonValue | undefined, path: PathSegment[], text: st
   return root as JsonValue;
 }
 
+/** Copies an existing JSON value to an object, array, or root path. */
+function applyCopy(
+  root: JsonValue | undefined,
+  from: PathSegment[],
+  path: PathSegment[],
+): JsonValue {
+  try {
+    validateFromPath(from);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while validating COPY paths');
+  }
+
+  const value = cloneJson(resolveActionValue(root, from, 'COPY').value) as JsonValue;
+  try {
+    return applyAdd(root, path, value);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while applying COPY path');
+  }
+}
+
+/** Moves an existing JSON value to an object, array, or root path. */
+function applyMove(
+  root: JsonValue | undefined,
+  from: PathSegment[],
+  path: PathSegment[],
+): JsonValue {
+  try {
+    validateFromPath(from);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while validating MOVE paths');
+  }
+  if (samePath(from, path)) return root as JsonValue;
+  try {
+    validateMovePaths(from, path);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while validating MOVE paths');
+  }
+
+  let value: JsonValue;
+  try {
+    value = removeAndReturn(root, from);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while resolving a MOVE from path');
+  }
+  try {
+    return applyAdd(root, path, value);
+  } catch (error: unknown) {
+    throw ensureJsyncError(error).withContext('while applying MOVE path');
+  }
+}
+
+function validateMovePaths(from: PathSegment[], path: PathSegment[]): void {
+  if (from.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidPath,
+      'The MOVE from path cannot target the root document.',
+    );
+  }
+  if (isDescendantPath(from, path)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidPath,
+      'The MOVE path cannot target a child of the MOVE from path.',
+    );
+  }
+}
+
+function validateFromPath(from: PathSegment[]): void {
+  for (const [segmentIndex, segment] of from.entries()) {
+    if (segment === '-') {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        "The from path cannot contain '-'.",
+      )
+        .withMetadata('segment', '-')
+        .withMetadata('segment_index', segmentIndex);
+    }
+  }
+}
+
+function isDescendantPath(parent: PathSegment[], child: PathSegment[]): boolean {
+  return child.length > parent.length && parent.every((segment, index) => segment === child[index]);
+}
+
+function samePath(left: PathSegment[], right: PathSegment[]): boolean {
+  return left.length === right.length && left.every((segment, index) => segment === right[index]);
+}
+
+/** Removes an existing value and returns it for a MOVE action. */
+function removeAndReturn(root: JsonValue | undefined, path: PathSegment[]): JsonValue {
+  if (path.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidPath,
+      'The MOVE from path cannot target the root document.',
+    ).withContext('while applying the final MOVE from path segment');
+  }
+
+  const parentPath = path.slice(0, -1);
+  const finalSegment = path[path.length - 1];
+  const parent = resolveActionContainer(root, parentPath, 'MOVE');
+
+  if (Array.isArray(parent)) {
+    if (typeof finalSegment !== 'number') {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'A MOVE array from segment must be a non-negative integer.',
+      )
+        .withMetadata('segment', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while applying the final MOVE from path segment');
+    }
+    if (finalSegment >= parent.length) {
+      throw new JsyncError(
+        JsyncErrorKind.ArrayIndexOutOfBounds,
+        'The MOVE index is outside the array.',
+      )
+        .withMetadata('index', finalSegment)
+        .withMetadata('length', parent.length)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while applying the final MOVE from path segment');
+    }
+    const [value] = parent.splice(finalSegment, 1);
+    return value;
+  }
+
+  if (isObject(parent)) {
+    if (typeof finalSegment !== 'string') {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidPath,
+        'A MOVE object from segment must be a string.',
+      )
+        .withMetadata('index', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while applying the final MOVE from path segment');
+    }
+    if (!Object.hasOwn(parent, finalSegment)) {
+      throw new JsyncError(
+        JsyncErrorKind.PathParentMissing,
+        'The MOVE object key does not exist.',
+      )
+        .withMetadata('key', finalSegment)
+        .withMetadata('segment_index', path.length - 1)
+        .withContext('while applying the final MOVE from path segment');
+    }
+    const value = parent[finalSegment];
+    delete parent[finalSegment];
+    return value;
+  }
+
+  throw new JsyncError(
+    JsyncErrorKind.PathParentNotContainer,
+    'The MOVE from path parent is a scalar instead of an object or array.',
+  )
+    .withMetadata('segment_index', path.length - 1)
+    .withContext('while applying the final MOVE from path segment');
+}
+
+type ContainerOperation = 'ADD' | 'REMOVE' | 'REPLACE' | 'APPEND' | 'PREPEND' | 'MOVE';
+type ValueOperation = 'APPEND' | 'PREPEND' | 'COPY';
+
 /** Resolves an existing object or array container for an action parent path. */
 function resolveActionContainer(
   root: JsonValue | undefined,
   path: PathSegment[],
-  operation: 'ADD' | 'REMOVE' | 'REPLACE' | 'APPEND' | 'PREPEND',
+  operation: ContainerOperation,
 ): JsonValue {
   try {
     return resolveContainer(root, path);
@@ -321,7 +482,7 @@ interface ResolvedValue {
 function resolveActionValue(
   root: JsonValue | undefined,
   path: PathSegment[],
-  operation: 'APPEND' | 'PREPEND',
+  operation: ValueOperation,
 ): ResolvedValue {
   try {
     return resolveValue(root, path);

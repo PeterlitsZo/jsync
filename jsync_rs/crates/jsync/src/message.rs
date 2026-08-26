@@ -55,6 +55,20 @@ pub enum Action {
         /// The text to prepend.
         text: String,
     },
+    /// Copies an existing JSON value to another path.
+    Copy {
+        /// The validated source path.
+        from: Vec<PathSegment>,
+        /// The validated destination path.
+        path: Vec<PathSegment>,
+    },
+    /// Moves an existing JSON value to another path.
+    Move {
+        /// The validated source path.
+        from: Vec<PathSegment>,
+        /// The validated destination path.
+        path: Vec<PathSegment>,
+    },
 }
 
 /// One segment in a validated Jsync action path.
@@ -257,6 +271,26 @@ fn parse_action(value: CborValue) -> Result<Action, JsyncError> {
                 .map_err(|error| error.with_context("while decoding the PREPEND text"))?;
             Ok(Action::Prepend { path, text })
         }
+        6 => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let from = parse_path(elements.next().expect("validated copy length"))
+                .map_err(|error| error.with_context("while parsing the COPY from path"))?;
+            let path = parse_path(elements.next().expect("validated copy length"))
+                .map_err(|error| error.with_context("while parsing the COPY path"))?;
+            Ok(Action::Copy { from, path })
+        }
+        7 => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let from = parse_path(elements.next().expect("validated move length"))
+                .map_err(|error| error.with_context("while parsing the MOVE from path"))?;
+            let path = parse_path(elements.next().expect("validated move length"))
+                .map_err(|error| error.with_context("while parsing the MOVE path"))?;
+            Ok(Action::Move { from, path })
+        }
         opcode => Err(JsyncError::new(
             JsyncErrorKind::UnknownAction,
             "The Jsync action opcode is not supported.",
@@ -345,6 +379,16 @@ fn action_to_cbor(action: &Action) -> Result<CborValue, JsyncError> {
             integer(5),
             path_to_cbor(path),
             CborValue::Text(text.clone()),
+        ])),
+        Action::Copy { from, path } => Ok(CborValue::Array(vec![
+            integer(6),
+            path_to_cbor(from),
+            path_to_cbor(path),
+        ])),
+        Action::Move { from, path } => Ok(CborValue::Array(vec![
+            integer(7),
+            path_to_cbor(from),
+            path_to_cbor(path),
         ])),
     }
 }

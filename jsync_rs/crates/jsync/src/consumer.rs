@@ -58,6 +58,8 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
         Action::Replace { path, value } => apply_replace(root, &path, value),
         Action::Append { path, text } => apply_append(root, &path, &text),
         Action::Prepend { path, text } => apply_prepend(root, &path, &text),
+        Action::Copy { from, path } => apply_copy(root, &from, &path),
+        Action::Move { from, path } => apply_move(root, &from, &path),
     }
 }
 
@@ -276,6 +278,132 @@ fn apply_prepend(root: &mut Value, path: &[PathSegment], text: &str) -> Result<(
     };
     target.insert_str(0, text);
     Ok(())
+}
+
+/// Copies an existing JSON value to an object, array, or root path.
+fn apply_copy(
+    root: &mut Value,
+    from: &[PathSegment],
+    path: &[PathSegment],
+) -> Result<(), JsyncError> {
+    validate_from_path(from).map_err(|error| error.with_context("while validating COPY paths"))?;
+    let value = resolve_value(root, from)
+        .map_err(|error| error.with_context("while resolving a COPY from path"))?
+        .clone();
+    apply_add(root, path, value).map_err(|error| error.with_context("while applying COPY path"))
+}
+
+/// Moves an existing JSON value to an object, array, or root path.
+fn apply_move(
+    root: &mut Value,
+    from: &[PathSegment],
+    path: &[PathSegment],
+) -> Result<(), JsyncError> {
+    validate_from_path(from).map_err(|error| error.with_context("while validating MOVE paths"))?;
+    if from == path {
+        return Ok(());
+    }
+    validate_move_paths(from, path)
+        .map_err(|error| error.with_context("while validating MOVE paths"))?;
+
+    let value = remove_and_return(root, from)
+        .map_err(|error| error.with_context("while resolving a MOVE from path"))?;
+    apply_add(root, path, value).map_err(|error| error.with_context("while applying MOVE path"))
+}
+
+fn validate_move_paths(from: &[PathSegment], path: &[PathSegment]) -> Result<(), JsyncError> {
+    if from.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "The MOVE from path cannot target the root document.",
+        ));
+    }
+    if is_descendant_path(from, path) {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "The MOVE path cannot target a child of the MOVE from path.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_from_path(from: &[PathSegment]) -> Result<(), JsyncError> {
+    for (segment_index, segment) in from.iter().enumerate() {
+        if matches!(segment, PathSegment::Key(key) if key == "-") {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidPath,
+                "The from path cannot contain '-'.",
+            )
+            .with_metadata("segment", "-")
+            .with_metadata("segment_index", segment_index.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn is_descendant_path(parent: &[PathSegment], child: &[PathSegment]) -> bool {
+    child.len() > parent.len() && child.starts_with(parent)
+}
+
+/// Removes an existing value and returns it for a MOVE action.
+fn remove_and_return(root: &mut Value, path: &[PathSegment]) -> Result<Value, JsyncError> {
+    if path.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "The MOVE from path cannot target the root document.",
+        )
+        .with_context("while applying the final MOVE from path segment"));
+    }
+
+    let (parent_path, final_segment) = path.split_at(path.len() - 1);
+    let parent = resolve_container(root, parent_path)
+        .map_err(|error| error.with_context("while resolving a MOVE from path parent"))?;
+    match (parent, &final_segment[0]) {
+        (Value::Object(object), PathSegment::Key(key)) => object.remove(key).ok_or_else(|| {
+            JsyncError::new(
+                JsyncErrorKind::PathParentMissing,
+                "The MOVE object key does not exist.",
+            )
+            .with_metadata("key", key.clone())
+            .with_metadata("segment_index", (path.len() - 1).to_string())
+            .with_context("while applying the final MOVE from path segment")
+        }),
+        (Value::Array(array), PathSegment::Index(index)) => {
+            if *index >= array.len() {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::ArrayIndexOutOfBounds,
+                    "The MOVE index is outside the array.",
+                )
+                .with_metadata("index", index.to_string())
+                .with_metadata("length", array.len().to_string())
+                .with_metadata("segment_index", (path.len() - 1).to_string())
+                .with_context("while applying the final MOVE from path segment"));
+            }
+            Ok(array.remove(*index))
+        }
+        (Value::Array(_), PathSegment::Key(key)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A MOVE array from segment must be a non-negative integer.",
+        )
+        .with_metadata("segment", key.clone())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final MOVE from path segment")),
+        (Value::Object(_), PathSegment::Index(index)) => Err(JsyncError::new(
+            JsyncErrorKind::InvalidPath,
+            "A MOVE object from segment must be a string.",
+        )
+        .with_metadata("index", index.to_string())
+        .with_metadata("segment_index", (path.len() - 1).to_string())
+        .with_context("while applying the final MOVE from path segment")),
+        (Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_), _) => {
+            Err(JsyncError::new(
+                JsyncErrorKind::PathParentNotContainer,
+                "The MOVE from path parent is a scalar instead of an object or array.",
+            )
+            .with_metadata("segment_index", (path.len() - 1).to_string())
+            .with_context("while applying the final MOVE from path segment"))
+        }
+    }
 }
 
 /// Resolves an existing object or array container for an action parent path.

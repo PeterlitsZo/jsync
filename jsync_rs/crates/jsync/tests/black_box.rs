@@ -198,3 +198,107 @@ fn producer_replaces_object_subtree_when_it_is_smaller() {
         }])
     );
 }
+
+#[test]
+fn copy_and_move_messages_round_trip() {
+    let message = Message::new(vec![
+        Action::Copy {
+            from: vec![key("source")],
+            path: vec![key("target")],
+        },
+        Action::Move {
+            from: vec![key("old")],
+            path: vec![key("new")],
+        },
+    ]);
+    let move_bytes = message.to_bytes().expect("copy/move message should encode");
+    assert_eq!(&move_bytes[..3], &[0xd9, 0xff, 0x01]);
+    assert_eq!(
+        Message::from_bytes(move_bytes).expect("copy/move message should decode"),
+        message
+    );
+}
+
+#[test]
+fn consumer_applies_copy_and_move_actions() {
+    let mut consumer = Consumer::new();
+    let message = Message::new(vec![
+        Action::Snapshot {
+            value: json!({
+                "source": {"nested": [1, 2]},
+                "items": ["a", "b", "c"],
+                "keep": true,
+            }),
+        },
+        Action::Copy {
+            from: vec![key("source")],
+            path: vec![key("target")],
+        },
+        Action::Move {
+            from: vec![key("items"), PathSegment::Index(0)],
+            path: vec![key("items"), PathSegment::Index(2)],
+        },
+    ])
+    .to_bytes()
+    .expect("copy/move message should encode");
+
+    consumer
+        .consume(&message)
+        .expect("copy/move message should apply");
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({
+            "source": {"nested": [1, 2]},
+            "target": {"nested": [1, 2]},
+            "items": ["b", "c", "a"],
+            "keep": true,
+        }))
+    );
+}
+
+#[test]
+fn producer_emits_copy_and_move_actions_for_reused_object_values() {
+    let shared = json!({
+        "name": "large repeated payload",
+        "items": [1, 2, 3, 4, 5],
+        "flags": {"active": true, "visible": false},
+    });
+    let mut producer = Producer::new(json!({
+        "old": shared.clone(),
+        "source": shared.clone(),
+        "keep": true,
+    }));
+    producer
+        .get_message()
+        .expect("initial message should encode")
+        .expect("initial snapshot should exist");
+
+    producer.update(json!({
+        "new": shared.clone(),
+        "source": shared.clone(),
+        "target": shared,
+        "keep": true,
+    }));
+    let message = producer
+        .get_message()
+        .expect("copy message should encode")
+        .expect("copy message should exist");
+
+    assert_eq!(
+        Message::from_bytes(message).expect("producer message should decode"),
+        Message::new(vec![
+            Action::Move {
+                from: vec![key("old")],
+                path: vec![key("new")],
+            },
+            Action::Copy {
+                from: vec![key("source")],
+                path: vec![key("target")],
+            },
+        ])
+    );
+}
+
+fn key(value: &str) -> PathSegment {
+    PathSegment::Key(value.to_string())
+}

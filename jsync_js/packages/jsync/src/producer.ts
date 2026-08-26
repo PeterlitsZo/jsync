@@ -1,5 +1,5 @@
 import { JsyncError, JsyncErrorKind } from './error.js';
-import { ADD, APPEND, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
+import { ADD, APPEND, COPY, MOVE, Message, PREPEND, REMOVE, REPLACE, SNAPSHOT } from './message.js';
 import { cloneJson, normalizeJson } from './value.js';
 import type { Action, PathSegment } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
@@ -83,21 +83,76 @@ function diffObjects(
   const removed = Object.keys(old)
     .filter((key) => !Object.hasOwn(next, key))
     .sort();
+  const added = Object.keys(next)
+    .filter((key) => !Object.hasOwn(old, key))
+    .sort();
+
+  const remainingRemoved: string[] = [];
   for (const key of removed) {
+    const addedIndex = added.findIndex((addedKey) => deepEqual(old[key], next[addedKey]));
+    if (addedIndex === -1) {
+      remainingRemoved.push(key);
+      continue;
+    }
+
+    const [addedKey] = added.splice(addedIndex, 1);
+    const moveAction: Action = {
+      type: MOVE,
+      from: childPath(path, key),
+      path: childPath(path, addedKey),
+    };
+    const fallback: Action[] = [
+      { type: REMOVE, path: childPath(path, key) },
+      { type: ADD, path: childPath(path, addedKey), value: cloneJson(next[addedKey]) as JsonValue },
+    ];
+    if (plan([moveAction]).cost < plan(fallback).cost) {
+      actions.push(moveAction);
+    } else {
+      remainingRemoved.push(key);
+      added.push(addedKey);
+      added.sort();
+    }
+  }
+
+  for (const key of remainingRemoved) {
     actions.push({ type: REMOVE, path: [...path, key] });
   }
 
   const common = Object.keys(old)
     .filter((key) => Object.hasOwn(next, key))
     .sort();
+  const unchanged = common.filter((key) => deepEqual(old[key], next[key]));
+
+  const remainingAdded: string[] = [];
+  for (const key of added) {
+    const source = unchanged.find((sourceKey) => deepEqual(old[sourceKey], next[key]));
+    if (source === undefined) {
+      remainingAdded.push(key);
+      continue;
+    }
+
+    const copyAction: Action = {
+      type: COPY,
+      from: childPath(path, source),
+      path: childPath(path, key),
+    };
+    const fallback: Action = {
+      type: ADD,
+      path: childPath(path, key),
+      value: cloneJson(next[key]) as JsonValue,
+    };
+    if (plan([copyAction]).cost < plan([fallback]).cost) {
+      actions.push(copyAction);
+    } else {
+      remainingAdded.push(key);
+    }
+  }
+
   for (const key of common) {
     actions.push(...buildDiff(old[key], next[key], [...path, key]).actions);
   }
 
-  const added = Object.keys(next)
-    .filter((key) => !Object.hasOwn(old, key))
-    .sort();
-  for (const key of added) {
+  for (const key of remainingAdded) {
     actions.push({
       type: ADD,
       path: [...path, key],
@@ -106,6 +161,10 @@ function diffObjects(
   }
 
   return plan(actions);
+}
+
+function childPath(path: PathSegment[], key: string): PathSegment[] {
+  return [...path, key];
 }
 
 function diffArrays(

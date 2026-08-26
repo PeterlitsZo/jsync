@@ -4,7 +4,9 @@ import {
   ADD,
   APPEND,
   Consumer,
+  COPY,
   Message,
+  MOVE,
   PREPEND,
   Producer,
   REMOVE,
@@ -131,5 +133,63 @@ test('producer replaces object subtree when it is smaller', () => {
   assert.deepEqual(
     Message.fromBytes(message),
     new Message([{ type: REPLACE, path: ['wrapper'], value: { a: 1, b: 1, c: 1, d: 1, e: 1 } }]),
+  );
+});
+
+test('copy and move messages round trip', () => {
+  const message = new Message([
+    { type: COPY, from: ['source'], path: ['target'] },
+    { type: MOVE, from: ['old'], path: ['new'] },
+  ]);
+  const bytes = message.toBytes();
+
+  assert.deepEqual([...bytes.slice(0, 3)], [0xd9, 0xff, 0x01]);
+  assert.deepEqual(Message.fromBytes(bytes), message);
+});
+
+test('consumer applies copy and move actions', () => {
+  const consumer = new Consumer();
+  consumer.consume(
+    new Message([
+      {
+        type: SNAPSHOT,
+        value: {
+          source: { nested: [1, 2] },
+          items: ['a', 'b', 'c'],
+          keep: true,
+        },
+      },
+      { type: COPY, from: ['source'], path: ['target'] },
+      { type: MOVE, from: ['items', 0], path: ['items', 2] },
+    ]).toBytes(),
+  );
+
+  assert.deepEqual(consumer.document, {
+    source: { nested: [1, 2] },
+    target: { nested: [1, 2] },
+    items: ['b', 'c', 'a'],
+    keep: true,
+  });
+});
+
+test('producer emits copy and move actions for reused object values', () => {
+  const shared = {
+    name: 'large repeated payload',
+    items: [1, 2, 3, 4, 5],
+    flags: { active: true, visible: false },
+  };
+  const producer = new Producer({ old: shared, source: shared, keep: true });
+  assert.ok(producer.getMessage());
+
+  producer.update({ new: shared, source: shared, target: shared, keep: true });
+  const message = producer.getMessage();
+  assert.ok(message);
+
+  assert.deepEqual(
+    Message.fromBytes(message),
+    new Message([
+      { type: MOVE, from: ['old'], path: ['new'] },
+      { type: COPY, from: ['source'], path: ['target'] },
+    ]),
   );
 });

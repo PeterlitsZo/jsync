@@ -99,9 +99,51 @@ fn diff_objects(
     let mut removed = old
         .keys()
         .filter(|key| !new.contains_key(*key))
+        .cloned()
         .collect::<Vec<_>>();
     removed.sort();
+    let mut added = new
+        .keys()
+        .filter(|key| !old.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    added.sort();
+
+    let mut move_actions = Vec::new();
+    let mut remaining_removed = Vec::new();
     for key in removed {
+        if let Some(added_index) = added
+            .iter()
+            .position(|added_key| old[&key] == new[added_key])
+        {
+            let added_key = added.remove(added_index);
+            let move_action = Action::Move {
+                from: child_path(path, &key),
+                path: child_path(path, &added_key),
+            };
+            let fallback = vec![
+                Action::Remove {
+                    path: child_path(path, &key),
+                },
+                Action::Add {
+                    path: child_path(path, &added_key),
+                    value: new[&added_key].clone(),
+                },
+            ];
+            if plan(vec![move_action.clone()])?.cost < plan(fallback.clone())?.cost {
+                move_actions.push(move_action);
+            } else {
+                remaining_removed.push(key);
+                added.push(added_key);
+                added.sort();
+            }
+        } else {
+            remaining_removed.push(key);
+        }
+    }
+    actions.extend(move_actions);
+
+    for key in remaining_removed {
         let mut target = path.clone();
         target.push(PathSegment::Key(key.clone()));
         actions.push(Action::Remove { path: target });
@@ -110,29 +152,61 @@ fn diff_objects(
     let mut common = old
         .keys()
         .filter(|key| new.contains_key(*key))
+        .cloned()
         .collect::<Vec<_>>();
     common.sort();
+    let unchanged = common
+        .iter()
+        .filter(|key| old[key.as_str()] == new[key.as_str()])
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut remaining_added = Vec::new();
+    for key in added {
+        if let Some(source) = unchanged
+            .iter()
+            .find(|source| old[source.as_str()] == new[&key])
+        {
+            let copy_action = Action::Copy {
+                from: child_path(path, source),
+                path: child_path(path, &key),
+            };
+            let fallback = Action::Add {
+                path: child_path(path, &key),
+                value: new[&key].clone(),
+            };
+            if plan(vec![copy_action.clone()])?.cost < plan(vec![fallback.clone()])?.cost {
+                actions.push(copy_action);
+            } else {
+                remaining_added.push(key);
+            }
+        } else {
+            remaining_added.push(key);
+        }
+    }
+
     for key in common {
         path.push(PathSegment::Key(key.clone()));
-        actions.extend(build_diff(&old[key], &new[key], path)?.actions);
+        actions.extend(build_diff(&old[key.as_str()], &new[key.as_str()], path)?.actions);
         path.pop();
     }
 
-    let mut added = new
-        .keys()
-        .filter(|key| !old.contains_key(*key))
-        .collect::<Vec<_>>();
-    added.sort();
-    for key in added {
+    for key in remaining_added {
         let mut target = path.clone();
         target.push(PathSegment::Key(key.clone()));
         actions.push(Action::Add {
             path: target,
-            value: new[key].clone(),
+            value: new[&key].clone(),
         });
     }
 
     Ok(plan(actions)?)
+}
+
+fn child_path(path: &[PathSegment], key: &str) -> Vec<PathSegment> {
+    let mut target = path.to_vec();
+    target.push(PathSegment::Key(key.to_string()));
+    target
 }
 
 fn diff_arrays(
