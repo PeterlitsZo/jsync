@@ -1,8 +1,9 @@
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from '../error.js';
-import { normalizeJson } from '../value.js';
+import { cloneJson, normalizeJson } from '../value.js';
 import type { JsonValue } from '../value.js';
 import {
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -73,6 +74,23 @@ export interface StringPatchAction {
   readonly edits: StringPatchEdit[];
 }
 
+/** One edit in an array patch action. */
+export interface ArrayPatchEdit {
+  /** Start index, measured against the original array. */
+  readonly start: number;
+  /** Number of elements to delete from the original array. */
+  readonly deleteCount: number;
+  /** Values to insert at start after deletion. */
+  readonly values: JsonValue[];
+}
+
+/** A validated ARRAY_PATCH action. */
+export interface ArrayPatchAction {
+  readonly type: typeof OPCODE_ARRAY_PATCH;
+  readonly path: PathSegment[];
+  readonly edits: ArrayPatchEdit[];
+}
+
 /** A validated COPY action. */
 export interface CopyAction {
   readonly type: typeof OPCODE_COPY;
@@ -96,6 +114,7 @@ export type Action =
   | StringAppendAction
   | StringPrependAction
   | StringPatchAction
+  | ArrayPatchAction
   | CopyAction
   | MoveAction;
 
@@ -145,6 +164,30 @@ export function parseStringPatchEdits(value: unknown): StringPatchEdit[] {
   });
 }
 
+export function parseArrayPatchEdits(value: unknown): ArrayPatchEdit[] {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'The ARRAY_PATCH edits must be an array.',
+    );
+  }
+  if (value.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'The ARRAY_PATCH edits cannot be empty.',
+    );
+  }
+  return value.map((edit: unknown, editIndex: number) => {
+    try {
+      return parseArrayPatchEdit(edit);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error)
+        .withMetadata('edit_index', editIndex)
+        .withContext('while decoding an ARRAY_PATCH edit');
+    }
+  });
+}
+
 function parseStringPatchEdit(value: unknown): StringPatchEdit {
   if (!Array.isArray(value)) {
     throw new JsyncError(
@@ -165,6 +208,43 @@ function parseStringPatchEdit(value: unknown): StringPatchEdit {
     deleteCount: parseNonNegativeInteger(value[1]),
     text: parseText(value[2]),
   };
+}
+
+function parseArrayPatchEdit(value: unknown): ArrayPatchEdit {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'An ARRAY_PATCH edit must be an array.',
+    );
+  }
+  if (value.length !== 3) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidActionLength,
+      'The Jsync action has an invalid number of elements.',
+    )
+      .withMetadata('expected', 3)
+      .withMetadata('actual', value.length);
+  }
+  if (!Array.isArray(value[2])) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'The ARRAY_PATCH edit values must be an array.',
+    );
+  }
+
+  const values = value[2].map((child) => normalizeJson(child));
+  const edit = {
+    start: parseNonNegativeInteger(value[0]),
+    deleteCount: parseNonNegativeInteger(value[1]),
+    values,
+  };
+  if (edit.deleteCount === 0 && edit.values.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'An ARRAY_PATCH edit must delete or insert values.',
+    );
+  }
+  return edit;
 }
 
 function parseNonNegativeInteger(value: unknown): number {
@@ -221,6 +301,15 @@ export function normalizeAction(action: Action): Action {
       ),
     };
   }
+  if (action.type === OPCODE_ARRAY_PATCH) {
+    return {
+      type: OPCODE_ARRAY_PATCH,
+      path: parsePath(action.path),
+      edits: parseArrayPatchEdits(
+        action.edits.map((edit) => [edit.start, edit.deleteCount, edit.values]),
+      ),
+    };
+  }
   if (action.type === OPCODE_COPY) {
     return {
       type: OPCODE_COPY,
@@ -242,5 +331,15 @@ export function normalizeAction(action: Action): Action {
 }
 
 export function cloneAction(action: Action): Action {
-  return normalizeAction(action);
+  const normalized = normalizeAction(action);
+  if (normalized.type !== OPCODE_ARRAY_PATCH) return normalized;
+  return {
+    type: OPCODE_ARRAY_PATCH,
+    path: [...normalized.path],
+    edits: normalized.edits.map((edit) => ({
+      start: edit.start,
+      deleteCount: edit.deleteCount,
+      values: edit.values.map((value) => cloneJson(value) as JsonValue),
+    })),
+  };
 }

@@ -16,3 +16,5 @@ export const OPCODE_COPY = 6;
 export const OPCODE_MOVE = 7;
 /** The STRING_PATCH action opcode. */
 export const OPCODE_STRING_PATCH = 8;
+/** The ARRAY_PATCH action opcode. */
+export const OPCODE_ARRAY_PATCH = 9;

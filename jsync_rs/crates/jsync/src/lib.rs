@@ -9,7 +9,7 @@ mod message;
 pub use consumer::Consumer;
 pub use error::{JsyncError, JsyncErrorKind};
 pub use message::{
-    Action, ConsumerPathSegmentPool, ConsumerPathSegmentPoolTransaction, Message, PathSegment,
-    ProducerPathSegmentPool, ProducerPathSegmentPoolTransaction, StringPatchEdit,
+    Action, ArrayPatchEdit, ConsumerPathSegmentPool, ConsumerPathSegmentPoolTransaction, Message,
+    PathSegment, ProducerPathSegmentPool, ProducerPathSegmentPoolTransaction, StringPatchEdit,
 };
 pub use producer::Producer;

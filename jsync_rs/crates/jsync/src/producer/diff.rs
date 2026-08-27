@@ -5,12 +5,16 @@ use serde_json::{Map, Value};
 use super::cost::plan;
 use super::digest::{ValueDigest, digest_value};
 use crate::error::JsyncError;
-use crate::message::{Action, PathSegment, ProducerPathSegmentPool, StringPatchEdit};
+use crate::message::{
+    Action, ArrayPatchEdit, PathSegment, ProducerPathSegmentPool, StringPatchEdit,
+};
 
 type DigestIndex = HashMap<ValueDigest, Vec<String>>;
 type KeyDigestIndex = HashMap<String, ValueDigest>;
 const MYERS_MIDDLE_PRODUCT_THRESHOLD: usize = 100_000;
 const MYERS_TRACE_CELL_THRESHOLD: usize = 2_000_000;
+const MYERS_ARRAY_MIDDLE_PRODUCT_THRESHOLD: usize = 100_000;
+const MYERS_ARRAY_TRACE_CELL_THRESHOLD: usize = 2_000_000;
 
 #[derive(Debug)]
 pub(super) struct DiffPlan {
@@ -168,7 +172,8 @@ fn index_unchanged_values_by_digest(
     let mut unchanged_by_digest = DigestIndex::new();
     for key in common {
         let old_digest = digest_value(&old[key.as_str()])?;
-        if old_digest == digest_value(&new[key.as_str()])? {
+        if old_digest == digest_value(&new[key.as_str()])? && old[key.as_str()] == new[key.as_str()]
+        {
             unchanged_by_digest
                 .entry(old_digest)
                 .or_default()
@@ -200,6 +205,10 @@ fn extract_move_actions(
             remaining_removed.push(key);
             continue;
         };
+        if old[key.as_str()] != new[added_key.as_str()] {
+            remaining_removed.push(key);
+            continue;
+        }
 
         let move_action = Action::Move {
             from: child_path(path, &key),
@@ -249,6 +258,10 @@ fn extract_copy_actions(
             remaining_added.push(key);
             continue;
         };
+        if new[key.as_str()] != new[source.as_str()] {
+            remaining_added.push(key);
+            continue;
+        }
 
         let copy_action = Action::Copy {
             from: child_path(path, source),
@@ -287,6 +300,31 @@ fn diff_arrays(
     path: &mut Vec<PathSegment>,
     path_segment_pool: &ProducerPathSegmentPool,
 ) -> Result<DiffPlan, JsyncError> {
+    let mut best = legacy_array_plan(old, new, path, path_segment_pool)?;
+
+    if let Some(single_patch) = single_array_patch_plan(old, new, path, path_segment_pool)? {
+        if single_patch.cost < best.cost {
+            best = single_patch;
+        }
+    }
+
+    if should_run_myers_array_diff(old, new) {
+        if let Some(myers_patch) = myers_array_patch_plan(old, new, path, path_segment_pool)? {
+            if myers_patch.cost < best.cost {
+                best = myers_patch;
+            }
+        }
+    }
+
+    Ok(best)
+}
+
+fn legacy_array_plan(
+    old: &[Value],
+    new: &[Value],
+    path: &mut Vec<PathSegment>,
+    path_segment_pool: &ProducerPathSegmentPool,
+) -> Result<DiffPlan, JsyncError> {
     let mut actions = Vec::new();
 
     for index in 0..old.len().min(new.len()) {
@@ -311,6 +349,301 @@ fn diff_arrays(
     }
 
     plan(actions, path_segment_pool)
+}
+
+fn single_array_patch_plan(
+    old: &[Value],
+    new: &[Value],
+    path: &[PathSegment],
+    path_segment_pool: &ProducerPathSegmentPool,
+) -> Result<Option<DiffPlan>, JsyncError> {
+    let prefix_len = common_array_prefix_len(old, new);
+    let suffix_len = common_array_suffix_len(old, new, prefix_len);
+    let old_mid_end = old.len() - suffix_len;
+    let new_mid_end = new.len() - suffix_len;
+    let delete_count = old_mid_end - prefix_len;
+    let values = new[prefix_len..new_mid_end].to_vec();
+    if delete_count == 0 && values.is_empty() {
+        return Ok(None);
+    }
+
+    plan(
+        vec![Action::ArrayPatch {
+            path: path.to_vec(),
+            edits: vec![ArrayPatchEdit {
+                start: prefix_len,
+                delete_count,
+                values,
+            }],
+        }],
+        path_segment_pool,
+    )
+    .map(Some)
+}
+
+fn myers_array_patch_plan(
+    old: &[Value],
+    new: &[Value],
+    path: &[PathSegment],
+    path_segment_pool: &ProducerPathSegmentPool,
+) -> Result<Option<DiffPlan>, JsyncError> {
+    let prefix_len = common_array_prefix_len(old, new);
+    let suffix_len = common_array_suffix_len(old, new, prefix_len);
+    let old_mid_end = old.len() - suffix_len;
+    let new_mid_end = new.len() - suffix_len;
+    let old_middle = &old[prefix_len..old_mid_end];
+    let new_middle = &new[prefix_len..new_mid_end];
+    if old_middle.is_empty() || new_middle.is_empty() {
+        return Ok(None);
+    }
+
+    let old_digests = old_middle
+        .iter()
+        .map(digest_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let new_digests = new_middle
+        .iter()
+        .map(digest_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let operations = myers_diff_arrays(
+        old_middle.len(),
+        new_middle.len(),
+        |old_index, new_index| {
+            old_digests[old_index] == new_digests[new_index]
+                && old_middle[old_index] == new_middle[new_index]
+        },
+    );
+    let edits = array_edit_ops_to_patch_edits(&operations, new_middle, prefix_len);
+    if edits.is_empty() {
+        return Ok(None);
+    }
+
+    plan(
+        vec![Action::ArrayPatch {
+            path: path.to_vec(),
+            edits,
+        }],
+        path_segment_pool,
+    )
+    .map(Some)
+}
+
+fn common_array_prefix_len(old: &[Value], new: &[Value]) -> usize {
+    old.iter()
+        .zip(new.iter())
+        .take_while(|(old, new)| old == new)
+        .count()
+}
+
+fn common_array_suffix_len(old: &[Value], new: &[Value], prefix_len: usize) -> usize {
+    let max_suffix_len = old.len().min(new.len()) - prefix_len;
+    old.iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(max_suffix_len)
+        .take_while(|(old, new)| old == new)
+        .count()
+}
+
+fn should_run_myers_array_diff(old: &[Value], new: &[Value]) -> bool {
+    let prefix_len = common_array_prefix_len(old, new);
+    let suffix_len = common_array_suffix_len(old, new, prefix_len);
+    let old_middle_len = old.len() - prefix_len - suffix_len;
+    let new_middle_len = new.len() - prefix_len - suffix_len;
+    if old_middle_len == 0 || new_middle_len == 0 {
+        return false;
+    }
+    let Some(product) = old_middle_len.checked_mul(new_middle_len) else {
+        return false;
+    };
+    if product > MYERS_ARRAY_MIDDLE_PRODUCT_THRESHOLD {
+        return false;
+    }
+
+    let Some(max) = old_middle_len.checked_add(new_middle_len) else {
+        return false;
+    };
+    let Some(trace_depth) = max.checked_add(1) else {
+        return false;
+    };
+    let Some(trace_width) = max.checked_mul(2).and_then(|value| value.checked_add(3)) else {
+        return false;
+    };
+    let Some(trace_cells) = trace_depth.checked_mul(trace_width) else {
+        return false;
+    };
+    trace_cells <= MYERS_ARRAY_TRACE_CELL_THRESHOLD
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ArrayEditOp {
+    Keep,
+    Delete,
+    Insert(usize),
+}
+
+fn myers_diff_arrays<F>(n: usize, m: usize, mut equal: F) -> Vec<ArrayEditOp>
+where
+    F: FnMut(usize, usize) -> bool,
+{
+    if n == 0 {
+        return (0..m).map(ArrayEditOp::Insert).collect();
+    }
+    if m == 0 {
+        return vec![ArrayEditOp::Delete; n];
+    }
+
+    let max = n + m;
+    let offset = max + 1;
+    let mut trace = Vec::new();
+    let mut v = vec![-1isize; 2 * max + 3];
+    v[offset + 1] = 0;
+
+    for d in 0..=max {
+        for k in (-(d as isize)..=(d as isize)).step_by(2) {
+            let index = (offset as isize + k) as usize;
+            let x = if k == -(d as isize) || (k != d as isize && v[index - 1] < v[index + 1]) {
+                v[index + 1]
+            } else {
+                v[index - 1] + 1
+            };
+            let mut x = x;
+            let mut y = x - k;
+            while x < n as isize && y < m as isize && equal(x as usize, y as usize) {
+                x += 1;
+                y += 1;
+            }
+            v[index] = x;
+            if x >= n as isize && y >= m as isize {
+                trace.push(v);
+                return backtrack_myers_array_diff(&trace, d, n, m, offset);
+            }
+        }
+        trace.push(v.clone());
+    }
+
+    unreachable!("Myers diff must reach the end within n + m edits")
+}
+
+fn backtrack_myers_array_diff(
+    trace: &[Vec<isize>],
+    edit_distance: usize,
+    n: usize,
+    m: usize,
+    offset: usize,
+) -> Vec<ArrayEditOp> {
+    let mut x = n as isize;
+    let mut y = m as isize;
+    let mut operations = Vec::new();
+
+    for d in (1..=edit_distance).rev() {
+        let k = x - y;
+        let previous = &trace[d - 1];
+        let previous_k = if k == -(d as isize)
+            || (k != d as isize
+                && previous[(offset as isize + k - 1) as usize]
+                    < previous[(offset as isize + k + 1) as usize])
+        {
+            k + 1
+        } else {
+            k - 1
+        };
+        let previous_x = previous[(offset as isize + previous_k) as usize];
+        let previous_y = previous_x - previous_k;
+
+        while x > previous_x && y > previous_y {
+            operations.push(ArrayEditOp::Keep);
+            x -= 1;
+            y -= 1;
+        }
+
+        if x == previous_x {
+            operations.push(ArrayEditOp::Insert((y - 1) as usize));
+            y -= 1;
+        } else {
+            operations.push(ArrayEditOp::Delete);
+            x -= 1;
+        }
+    }
+
+    while x > 0 && y > 0 {
+        operations.push(ArrayEditOp::Keep);
+        x -= 1;
+        y -= 1;
+    }
+
+    operations.reverse();
+    operations
+}
+
+fn array_edit_ops_to_patch_edits(
+    operations: &[ArrayEditOp],
+    new_values: &[Value],
+    prefix_offset: usize,
+) -> Vec<ArrayPatchEdit> {
+    let mut edits = Vec::new();
+    let mut old_cursor = 0usize;
+    let mut hunk_start = None;
+    let mut delete_count = 0usize;
+    let mut values = Vec::new();
+
+    for operation in operations {
+        match operation {
+            ArrayEditOp::Keep => {
+                flush_array_patch_hunk(
+                    &mut edits,
+                    &mut hunk_start,
+                    &mut delete_count,
+                    &mut values,
+                    prefix_offset,
+                );
+                old_cursor += 1;
+            }
+            ArrayEditOp::Delete => {
+                if hunk_start.is_none() {
+                    hunk_start = Some(old_cursor);
+                }
+                delete_count += 1;
+                old_cursor += 1;
+            }
+            ArrayEditOp::Insert(new_index) => {
+                if hunk_start.is_none() {
+                    hunk_start = Some(old_cursor);
+                }
+                values.push(new_values[*new_index].clone());
+            }
+        }
+    }
+
+    flush_array_patch_hunk(
+        &mut edits,
+        &mut hunk_start,
+        &mut delete_count,
+        &mut values,
+        prefix_offset,
+    );
+    edits.reverse();
+    edits
+}
+
+fn flush_array_patch_hunk(
+    edits: &mut Vec<ArrayPatchEdit>,
+    hunk_start: &mut Option<usize>,
+    delete_count: &mut usize,
+    values: &mut Vec<Value>,
+    prefix_offset: usize,
+) {
+    let Some(start) = hunk_start.take() else {
+        return;
+    };
+    if *delete_count > 0 || !values.is_empty() {
+        edits.push(ArrayPatchEdit {
+            start: prefix_offset + start,
+            delete_count: *delete_count,
+            values: std::mem::take(values),
+        });
+    }
+    *delete_count = 0;
 }
 
 fn diff_strings(

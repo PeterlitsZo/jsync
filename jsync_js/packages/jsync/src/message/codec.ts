@@ -2,15 +2,17 @@ import { Decoder, Encoder } from 'cbor-x';
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from '../error.js';
 import { cloneJson, normalizeJson } from '../value.js';
 import {
+  parseArrayPatchEdits,
   parsePath,
   parseText,
   parseStringPatchEdits,
   cloneAction,
   normalizeAction,
 } from './action.js';
-import type { Action, PathSegment, StringPatchEdit } from './action.js';
+import type { Action, ArrayPatchEdit, PathSegment, StringPatchEdit } from './action.js';
 import {
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -314,6 +316,22 @@ function parseAction(value: unknown, transaction: ConsumerPathSegmentPoolTransac
     }
     return { type: OPCODE_STRING_PATCH, path, edits };
   }
+  if (opcode === OPCODE_ARRAY_PATCH) {
+    requireActionLength(value.length, 3);
+    let path: PathSegment[];
+    try {
+      path = parsePooledPath(value[1], transaction);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the ARRAY_PATCH path');
+    }
+    let edits: ArrayPatchEdit[];
+    try {
+      edits = parseArrayPatchEdits(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while decoding the ARRAY_PATCH edits');
+    }
+    return { type: OPCODE_ARRAY_PATCH, path, edits };
+  }
   if (opcode === OPCODE_COPY) {
     requireActionLength(value.length, 3);
     let from: PathSegment[];
@@ -420,6 +438,17 @@ function encodeAction(action: Action, transaction: ProducerPathSegmentPoolTransa
       OPCODE_STRING_PATCH,
       transaction.encodePath(action.path),
       action.edits.map((edit) => [edit.start, edit.deleteCount, edit.text]),
+    ];
+  }
+  if (action.type === OPCODE_ARRAY_PATCH) {
+    return [
+      OPCODE_ARRAY_PATCH,
+      transaction.encodePath(action.path),
+      action.edits.map((edit) => [
+        edit.start,
+        edit.deleteCount,
+        edit.values.map((value) => cloneJson(value)),
+      ]),
     ];
   }
   return [

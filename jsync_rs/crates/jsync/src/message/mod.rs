@@ -4,15 +4,15 @@ mod json_cbor;
 mod opcode;
 mod pool;
 
-pub use action::{Action, PathSegment, StringPatchEdit};
+pub use action::{Action, ArrayPatchEdit, PathSegment, StringPatchEdit};
 pub use pool::{
     ConsumerPathSegmentPool, ConsumerPathSegmentPoolTransaction, ProducerPathSegmentPool,
     ProducerPathSegmentPoolTransaction,
 };
 
 pub(crate) use opcode::{
-    OPCODE_ADD, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE, OPCODE_SNAPSHOT,
-    OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
+    OPCODE_ADD, OPCODE_ARRAY_PATCH, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE,
+    OPCODE_SNAPSHOT, OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
 };
 
 use crate::error::JsyncError;

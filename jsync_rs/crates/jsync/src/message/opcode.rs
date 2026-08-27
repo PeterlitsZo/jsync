@@ -7,3 +7,4 @@ pub(crate) const OPCODE_STRING_PREPEND: u64 = 5;
 pub(crate) const OPCODE_COPY: u64 = 6;
 pub(crate) const OPCODE_MOVE: u64 = 7;
 pub(crate) const OPCODE_STRING_PATCH: u64 = 8;
+pub(crate) const OPCODE_ARRAY_PATCH: u64 = 9;

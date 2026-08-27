@@ -8,8 +8,8 @@ use crate::error::{JsyncError, JsyncErrorKind};
 use crate::message::Message;
 use crate::message::{Action, PathSegment, ProducerPathSegmentPool};
 use crate::message::{
-    OPCODE_ADD, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE, OPCODE_SNAPSHOT,
-    OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
+    OPCODE_ADD, OPCODE_ARRAY_PATCH, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE,
+    OPCODE_SNAPSHOT, OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
 };
 
 pub(super) fn plan(
@@ -127,6 +127,19 @@ impl<'a> CostEstimator<'a> {
                             + cbor_text_len(&edit.text)
                     })
                     .sum::<usize>()),
+            Action::ArrayPatch { path, edits } => Ok(cbor_array_header_len(3)
+                + cbor_uint_len(OPCODE_ARRAY_PATCH)
+                + self.estimate_path_len(path)
+                + cbor_array_header_len(edits.len())
+                + edits
+                    .iter()
+                    .map(|edit| {
+                        Ok(cbor_array_header_len(3)
+                            + cbor_uint_len(edit.start as u64)
+                            + cbor_uint_len(edit.delete_count as u64)
+                            + estimate_json_array_len(&edit.values)?)
+                    })
+                    .try_fold(0usize, |total, cost| Ok(total + cost?))?),
             Action::Copy { from, path } => Ok(cbor_array_header_len(3)
                 + cbor_uint_len(OPCODE_COPY)
                 + self.estimate_path_len(from)
@@ -171,6 +184,15 @@ impl<'a> CostEstimator<'a> {
     }
 }
 
+fn estimate_json_array_len(values: &[Value]) -> Result<usize, JsyncError> {
+    values
+        .iter()
+        .map(estimate_json_value_len)
+        .try_fold(cbor_array_header_len(values.len()), |total, cost| {
+            Ok(total + cost?)
+        })
+}
+
 fn estimate_path_segment_len(segment: &PathSegment) -> Result<usize, JsyncError> {
     match segment {
         PathSegment::Key(key) => Ok(cbor_text_len(key)),
@@ -183,12 +205,7 @@ fn estimate_json_value_len(value: &Value) -> Result<usize, JsyncError> {
         Value::Null | Value::Bool(_) => Ok(1),
         Value::Number(number) => estimate_json_number_len(number),
         Value::String(value) => Ok(cbor_text_len(value)),
-        Value::Array(values) => values
-            .iter()
-            .map(estimate_json_value_len)
-            .try_fold(cbor_array_header_len(values.len()), |total, cost| {
-                Ok(total + cost?)
-            }),
+        Value::Array(values) => estimate_json_array_len(values),
         Value::Object(object) => object
             .iter()
             .try_fold(cbor_map_header_len(object.len()), |total, (key, value)| {

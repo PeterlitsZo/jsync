@@ -2,6 +2,7 @@ import { JsyncError, JsyncErrorKind } from '../error.js';
 import {
   Message,
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_REMOVE,
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
@@ -121,6 +122,20 @@ class CostEstimator {
           0,
         );
     }
+    if (action.type === OPCODE_ARRAY_PATCH) {
+      return cborArrayHeaderLength(3)
+        + cborUnsignedIntegerLength(OPCODE_ARRAY_PATCH)
+        + this.estimatePathLength(action.path)
+        + cborArrayHeaderLength(action.edits.length)
+        + action.edits.reduce<number>(
+          (total, edit) => total
+            + cborArrayHeaderLength(3)
+            + cborUnsignedIntegerLength(edit.start)
+            + cborUnsignedIntegerLength(edit.deleteCount)
+            + estimateJsonArrayLength(edit.values),
+          0,
+        );
+    }
     return cborArrayHeaderLength(3)
       + cborUnsignedIntegerLength(action.type)
       + this.estimatePathLength(action.from)
@@ -163,13 +178,17 @@ function estimatePathSegmentLength(segment: PathSegment): number {
   return typeof segment === 'string' ? cborTextLength(segment) : cborUnsignedIntegerLength(segment);
 }
 
+function estimateJsonArrayLength(value: readonly JsonValue[]): number {
+  return cborArrayHeaderLength(value.length)
+    + value.reduce<number>((total, child) => total + estimateJsonValueLength(child), 0);
+}
+
 function estimateJsonValueLength(value: JsonValue): number {
   if (value === null || typeof value === 'boolean') return 1;
   if (typeof value === 'number') return estimateJsonNumberLength(value);
   if (typeof value === 'string') return cborTextLength(value);
   if (Array.isArray(value)) {
-    return cborArrayHeaderLength(value.length)
-      + value.reduce<number>((total, child) => total + estimateJsonValueLength(child), 0);
+    return estimateJsonArrayLength(value);
   }
 
   const entries = Object.entries(value);

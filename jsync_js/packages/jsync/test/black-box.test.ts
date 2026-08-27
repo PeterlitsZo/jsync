@@ -4,6 +4,7 @@ import {
   Consumer,
   Message,
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -15,7 +16,7 @@ import {
   Producer,
   ProducerPathSegmentPool,
 } from '../src/index.js';
-import type { Action, StringPatchEdit } from '../src/index.js';
+import type { Action, ArrayPatchEdit, StringPatchEdit } from '../src/index.js';
 import type { JsonValue } from '../src/index.js';
 
 test('producer messages keep consumer in sync', () => {
@@ -62,7 +63,11 @@ test('producer messages keep consumer in sync', () => {
         tags: ['math'],
       },
       new Message([
-        { type: OPCODE_REPLACE, path: ['items'], value: ['gamma'] },
+        {
+          type: OPCODE_ARRAY_PATCH,
+          path: ['items'],
+          edits: [{ start: 0, deleteCount: 2, values: [] }],
+        },
         { type: OPCODE_REPLACE, path: ['revision'], value: 3 },
         { type: OPCODE_REMOVE, path: ['tags', 1] },
       ]),
@@ -200,6 +205,68 @@ test('consumer applies copy and move actions', () => {
   });
 });
 
+test('array patch message round trips and applies', () => {
+  const message = new Message([
+    { type: OPCODE_SNAPSHOT, value: { items: ['a', 'b', 'c', 'd', 'e'] } },
+    {
+      type: OPCODE_ARRAY_PATCH,
+      path: ['items'],
+      edits: [
+        { start: 3, deleteCount: 1, values: ['D'] },
+        { start: 1, deleteCount: 1, values: ['B', 'BB'] },
+      ],
+    },
+  ]);
+  const encodePool = new ProducerPathSegmentPool();
+  const bytes = encodeMessage(encodePool, message);
+  const consumer = new Consumer();
+
+  assert.deepEqual(consumer.decodeMessageDryRun(bytes), message);
+  consumer.consume(bytes);
+  assert.deepEqual(consumer.document, { items: ['a', 'B', 'BB', 'c', 'D', 'e'] });
+});
+
+test('array patch can target root array', () => {
+  const message = new Message([
+    { type: OPCODE_SNAPSHOT, value: ['a', 'b', 'c'] },
+    {
+      type: OPCODE_ARRAY_PATCH,
+      path: [],
+      edits: [{ start: 1, deleteCount: 1, values: ['B', 'BB'] }],
+    },
+  ]);
+  const encodePool = new ProducerPathSegmentPool();
+  const consumer = new Consumer();
+
+  consumer.consume(encodeMessage(encodePool, message));
+  assert.deepEqual(consumer.document, ['a', 'B', 'BB', 'c']);
+});
+
+test('array patch fixture bytes are cross-language compatible', () => {
+  const message = new Message([
+    { type: OPCODE_SNAPSHOT, value: ['a', 'b', 'c', 'd'] },
+    {
+      type: OPCODE_ARRAY_PATCH,
+      path: [],
+      edits: [
+        { start: 2, deleteCount: 1, values: ['C'] },
+        { start: 0, deleteCount: 0, values: ['A'] },
+      ],
+    },
+  ]);
+  const expectedBytes = Uint8Array.from([
+    217, 255, 1, 130, 129, 128, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131,
+    9, 128, 130, 131, 2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
+  ]);
+  const encodePool = new ProducerPathSegmentPool();
+  const consumer = new Consumer();
+
+  assert.deepEqual(encodeMessage(encodePool, message), expectedBytes);
+  assert.deepEqual(consumer.decodeMessageDryRun(expectedBytes), message);
+  consumer.consume(expectedBytes);
+  assert.deepEqual(consumer.document, ['A', 'a', 'b', 'C', 'd']);
+});
+
 test('producer emits copy and move actions for reused object values', () => {
   const shared = {
     name: 'large repeated payload',
@@ -308,6 +375,67 @@ test('producer replaces completely different large strings', () => {
   );
 });
 
+test('producer emits array patch for middle insert', () => {
+  const anchorA = 'a'.repeat(80);
+  const anchorB = 'b'.repeat(80);
+  const decoded = producerUpdateMessage(
+    { items: [anchorA, anchorB] },
+    { items: [anchorA, 'inserted', anchorB] },
+  );
+
+  assert.deepEqual(
+    decoded,
+    new Message([
+      {
+        type: OPCODE_ARRAY_PATCH,
+        path: ['items'],
+        edits: [{ start: 1, deleteCount: 0, values: ['inserted'] }],
+      },
+    ]),
+  );
+});
+
+test('producer emits array patch with multiple myers edits', () => {
+  const anchorA = 'a'.repeat(80);
+  const anchorC = 'c'.repeat(80);
+  const anchorE = 'e'.repeat(80);
+  const decoded = producerUpdateMessage(
+    { items: [anchorA, anchorC, anchorE] },
+    { items: [anchorA, 'b', anchorC, 'd', anchorE] },
+  );
+
+  assert.deepEqual(
+    decoded,
+    new Message([
+      {
+        type: OPCODE_ARRAY_PATCH,
+        path: ['items'],
+        edits: [
+          { start: 2, deleteCount: 0, values: ['d'] },
+          { start: 1, deleteCount: 0, values: ['b'] },
+        ],
+      },
+    ]),
+  );
+});
+
+test('producer keeps recursive array diff when it is smaller', () => {
+  const old = `${'a'.repeat(80)}${'b'.repeat(80)}`;
+  const next = `${'a'.repeat(80)}XYZ${'b'.repeat(80)}`;
+  const decoded = producerUpdateMessage({ items: [old] }, { items: [next] });
+
+  assert.deepEqual(
+    decoded,
+    new Message([
+      {
+        type: OPCODE_STRING_PATCH,
+        path: ['items', 0],
+        edits: [{ start: 80, deleteCount: 0, text: 'XYZ' }],
+      },
+    ]),
+  );
+});
+
 test('string patch message round trips and applies', () => {
   const message = new Message([
     { type: OPCODE_SNAPSHOT, value: { text: 'abc def ghi' } },
@@ -349,6 +477,31 @@ test('invalid string patch edits do not commit document or path pool', () => {
   }
 });
 
+test('invalid array patch edits do not commit document or path pool', () => {
+  for (const edits of [
+    [],
+    [{ start: 1, deleteCount: 0, values: [] }],
+  ] satisfies ArrayPatchEdit[][]) {
+    assert.throws(() => new Message([{ type: OPCODE_ARRAY_PATCH, path: ['items'], edits }]));
+  }
+
+  const invalidEdits: ArrayPatchEdit[][] = [
+    [{ start: 7, deleteCount: 0, values: ['x'] }],
+    [
+      { start: 1, deleteCount: 1, values: ['x'] },
+      { start: 3, deleteCount: 1, values: ['y'] },
+    ],
+    [
+      { start: 3, deleteCount: 2, values: [] },
+      { start: 2, deleteCount: 2, values: [] },
+    ],
+  ];
+
+  for (const edits of invalidEdits) {
+    assertInvalidArrayPatchRollsBack(edits);
+  }
+});
+
 function producerUpdateMessage(initial: JsonValue, update: JsonValue): Message {
   const producer = new Producer(initial);
   const inspector = new Consumer();
@@ -384,4 +537,23 @@ function assertInvalidStringPatchRollsBack(edits: StringPatchEdit[]): void {
   ]);
   assert.throws(() => consumer.consume(encodeMessage(encodePool, pooledPathFollowup)));
   assert.deepEqual(consumer.document, { text: 'abcdef' });
+}
+
+function assertInvalidArrayPatchRollsBack(edits: ArrayPatchEdit[]): void {
+  const consumer = new Consumer();
+  const encodePool = new ProducerPathSegmentPool();
+  const initial = new Message([
+    { type: OPCODE_SNAPSHOT, value: { items: ['a', 'b', 'c', 'd', 'e', 'f'] } },
+  ]);
+  consumer.consume(encodeMessage(encodePool, initial));
+
+  const invalid = new Message([{ type: OPCODE_ARRAY_PATCH, path: ['items'], edits }]);
+  assert.throws(() => consumer.consume(encodeMessage(encodePool, invalid)));
+  assert.deepEqual(consumer.document, { items: ['a', 'b', 'c', 'd', 'e', 'f'] });
+
+  const pooledPathFollowup = new Message([
+    { type: OPCODE_STRING_APPEND, path: ['items', 0], text: '!' },
+  ]);
+  assert.throws(() => consumer.consume(encodeMessage(encodePool, pooledPathFollowup)));
+  assert.deepEqual(consumer.document, { items: ['a', 'b', 'c', 'd', 'e', 'f'] });
 }

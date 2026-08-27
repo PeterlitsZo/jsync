@@ -1,5 +1,6 @@
 use jsync::{
-    Action, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool, StringPatchEdit,
+    Action, ArrayPatchEdit, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool,
+    StringPatchEdit,
 };
 use serde_json::{Value, json};
 
@@ -89,9 +90,13 @@ fn producer_messages_keep_consumer_in_sync() {
                 "tags": ["math"],
             }),
             expected_message: Message::new(vec![
-                Action::Replace {
+                Action::ArrayPatch {
                     path: vec![PathSegment::Key("items".to_string())],
-                    value: json!(["gamma"]),
+                    edits: vec![ArrayPatchEdit {
+                        start: 0,
+                        delete_count: 2,
+                        values: Vec::new(),
+                    }],
                 },
                 Action::Replace {
                     path: vec![PathSegment::Key("revision".to_string())],
@@ -101,7 +106,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     path: vec![PathSegment::Key("tags".to_string()), PathSegment::Index(1)],
                 },
             ]),
-            expected_message_bytes_len: 29,
+            expected_message_bytes_len: 27,
         },
         UpdateCase {
             to_update: json!(["root replacement", {"revision": 4}, [1, 2, 3]]),
@@ -183,6 +188,36 @@ fn producer_messages_keep_consumer_in_sync() {
                 },
             ]),
             expected_message_bytes_len: 21,
+        },
+        UpdateCase {
+            to_update: json!({
+                "revision": 7,
+                "profile": {"name": "Peterlits The Zo", "active": false},
+                "items": ["delta", "epsilon"],
+                "tags": ["person", "red", "me", "male"],
+            }),
+            expected_message: Message::new(vec![
+                Action::StringPatch {
+                    path: vec![
+                        PathSegment::Key("profile".to_string()),
+                        PathSegment::Key("name".to_string()),
+                    ],
+                    edits: vec![StringPatchEdit {
+                        start: 10,
+                        delete_count: 0,
+                        text: "The ".to_string(),
+                    }],
+                },
+                Action::ArrayPatch {
+                    path: vec![PathSegment::Key("tags".to_string())],
+                    edits: vec![ArrayPatchEdit {
+                        start: 1,
+                        delete_count: 0,
+                        values: vec![json!("red"), json!("me")],
+                    }],
+                },
+            ]),
+            expected_message_bytes_len: 37,
         },
     ];
 
@@ -336,6 +371,115 @@ fn consumer_applies_copy_and_move_actions() {
 }
 
 #[test]
+fn array_patch_message_round_trips_and_applies() {
+    let message = Message::new(vec![
+        Action::Snapshot {
+            value: json!({"items": ["a", "b", "c", "d", "e"]}),
+        },
+        Action::ArrayPatch {
+            path: vec![key("items")],
+            edits: vec![
+                ArrayPatchEdit {
+                    start: 3,
+                    delete_count: 1,
+                    values: vec![json!("D")],
+                },
+                ArrayPatchEdit {
+                    start: 1,
+                    delete_count: 1,
+                    values: vec![json!("B"), json!("BB")],
+                },
+            ],
+        },
+    ]);
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let bytes = encode_message(&mut encode_pool, &message);
+    let mut consumer = Consumer::new();
+
+    assert_eq!(
+        consumer
+            .decode_message_dry_run(&bytes)
+            .expect("array patch message should decode"),
+        message
+    );
+    consumer
+        .consume(&bytes)
+        .expect("array patch message should apply");
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({"items": ["a", "B", "BB", "c", "D", "e"]}))
+    );
+}
+
+#[test]
+fn array_patch_can_target_root_array() {
+    let message = Message::new(vec![
+        Action::Snapshot {
+            value: json!(["a", "b", "c"]),
+        },
+        Action::ArrayPatch {
+            path: vec![],
+            edits: vec![ArrayPatchEdit {
+                start: 1,
+                delete_count: 1,
+                values: vec![json!("B"), json!("BB")],
+            }],
+        },
+    ]);
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let bytes = encode_message(&mut encode_pool, &message);
+    let mut consumer = Consumer::new();
+
+    consumer
+        .consume(&bytes)
+        .expect("root array patch should apply");
+    assert_eq!(consumer.document(), Some(&json!(["a", "B", "BB", "c"])));
+}
+
+#[test]
+fn array_patch_fixture_bytes_are_cross_language_compatible() {
+    let message = Message::new(vec![
+        Action::Snapshot {
+            value: json!(["a", "b", "c", "d"]),
+        },
+        Action::ArrayPatch {
+            path: vec![],
+            edits: vec![
+                ArrayPatchEdit {
+                    start: 2,
+                    delete_count: 1,
+                    values: vec![json!("C")],
+                },
+                ArrayPatchEdit {
+                    start: 0,
+                    delete_count: 0,
+                    values: vec![json!("A")],
+                },
+            ],
+        },
+    ]);
+    let expected_bytes = vec![
+        217, 255, 1, 130, 129, 128, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131, 9, 128,
+        130, 131, 2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
+    ];
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let bytes = encode_message(&mut encode_pool, &message);
+    let mut consumer = Consumer::new();
+
+    assert_eq!(bytes, expected_bytes);
+    assert_eq!(
+        consumer
+            .decode_message_dry_run(&expected_bytes)
+            .expect("cross-language fixture should decode"),
+        message
+    );
+    consumer
+        .consume(&expected_bytes)
+        .expect("cross-language fixture should apply");
+    assert_eq!(consumer.document(), Some(&json!(["A", "a", "b", "C", "d"])));
+}
+
+#[test]
 fn producer_emits_copy_and_move_actions_for_reused_object_values() {
     let shared = json!({
         "name": "large repeated payload",
@@ -484,6 +628,77 @@ fn producer_replaces_completely_different_large_strings() {
 }
 
 #[test]
+fn producer_emits_array_patch_for_middle_insert() {
+    let anchor_a = "a".repeat(80);
+    let anchor_b = "b".repeat(80);
+    let decoded = producer_update_message(
+        json!({"items": [anchor_a, anchor_b]}),
+        json!({"items": [anchor_a, "inserted", anchor_b]}),
+    );
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::ArrayPatch {
+            path: vec![key("items")],
+            edits: vec![ArrayPatchEdit {
+                start: 1,
+                delete_count: 0,
+                values: vec![json!("inserted")],
+            }],
+        }])
+    );
+}
+
+#[test]
+fn producer_emits_array_patch_with_multiple_myers_edits() {
+    let anchor_a = "a".repeat(80);
+    let anchor_c = "c".repeat(80);
+    let anchor_e = "e".repeat(80);
+    let decoded = producer_update_message(
+        json!({"items": [anchor_a, anchor_c, anchor_e]}),
+        json!({"items": [anchor_a, "b", anchor_c, "d", anchor_e]}),
+    );
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::ArrayPatch {
+            path: vec![key("items")],
+            edits: vec![
+                ArrayPatchEdit {
+                    start: 2,
+                    delete_count: 0,
+                    values: vec![json!("d")],
+                },
+                ArrayPatchEdit {
+                    start: 1,
+                    delete_count: 0,
+                    values: vec![json!("b")],
+                },
+            ],
+        }])
+    );
+}
+
+#[test]
+fn producer_keeps_recursive_array_diff_when_it_is_smaller() {
+    let old = format!("{}{}", "a".repeat(80), "b".repeat(80));
+    let new = format!("{}XYZ{}", "a".repeat(80), "b".repeat(80));
+    let decoded = producer_update_message(json!({"items": [old]}), json!({"items": [new]}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::StringPatch {
+            path: vec![key("items"), PathSegment::Index(0)],
+            edits: vec![StringPatchEdit {
+                start: 80,
+                delete_count: 0,
+                text: "XYZ".to_string(),
+            }],
+        }])
+    );
+}
+
+#[test]
 fn string_patch_message_round_trips_and_applies() {
     let message = Message::new(vec![
         Action::Snapshot {
@@ -564,6 +779,49 @@ fn invalid_string_patch_edits_do_not_commit_document_or_path_pool() {
     }
 }
 
+#[test]
+fn invalid_array_patch_edits_do_not_commit_document_or_path_pool() {
+    for edits in [
+        Vec::<ArrayPatchEdit>::new(),
+        vec![ArrayPatchEdit {
+            start: 1,
+            delete_count: 0,
+            values: Vec::new(),
+        }],
+        vec![ArrayPatchEdit {
+            start: 7,
+            delete_count: 0,
+            values: vec![json!("x")],
+        }],
+        vec![
+            ArrayPatchEdit {
+                start: 1,
+                delete_count: 1,
+                values: vec![json!("x")],
+            },
+            ArrayPatchEdit {
+                start: 3,
+                delete_count: 1,
+                values: vec![json!("y")],
+            },
+        ],
+        vec![
+            ArrayPatchEdit {
+                start: 3,
+                delete_count: 2,
+                values: Vec::new(),
+            },
+            ArrayPatchEdit {
+                start: 2,
+                delete_count: 2,
+                values: Vec::new(),
+            },
+        ],
+    ] {
+        assert_invalid_array_patch_rolls_back(edits);
+    }
+}
+
 fn producer_update_message(initial: Value, update: Value) -> Message {
     let mut producer = Producer::new(initial);
     let mut inspector = Consumer::new();
@@ -616,6 +874,40 @@ fn assert_invalid_string_patch_rolls_back(edits: Vec<StringPatchEdit>) {
     let pooled_path_followup_bytes = encode_message(&mut encode_pool, &pooled_path_followup);
     assert!(consumer.consume(&pooled_path_followup_bytes).is_err());
     assert_eq!(consumer.document(), Some(&json!({"text": "abcdef"})));
+}
+
+fn assert_invalid_array_patch_rolls_back(edits: Vec<ArrayPatchEdit>) {
+    let mut consumer = Consumer::new();
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let initial = Message::new(vec![Action::Snapshot {
+        value: json!({"items": ["a", "b", "c", "d", "e", "f"]}),
+    }]);
+    let initial_bytes = encode_message(&mut encode_pool, &initial);
+    consumer
+        .consume(&initial_bytes)
+        .expect("initial snapshot should apply");
+
+    let invalid = Message::new(vec![Action::ArrayPatch {
+        path: vec![key("items")],
+        edits,
+    }]);
+    let invalid_bytes = encode_message(&mut encode_pool, &invalid);
+    assert!(consumer.consume(&invalid_bytes).is_err());
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({"items": ["a", "b", "c", "d", "e", "f"]}))
+    );
+
+    let pooled_path_followup = Message::new(vec![Action::StringAppend {
+        path: vec![key("items"), PathSegment::Index(0)],
+        text: "!".to_string(),
+    }]);
+    let pooled_path_followup_bytes = encode_message(&mut encode_pool, &pooled_path_followup);
+    assert!(consumer.consume(&pooled_path_followup_bytes).is_err());
+    assert_eq!(
+        consumer.document(),
+        Some(&json!({"items": ["a", "b", "c", "d", "e", "f"]}))
+    );
 }
 
 fn encode_message(encode_pool: &mut ProducerPathSegmentPool, message: &Message) -> Vec<u8> {

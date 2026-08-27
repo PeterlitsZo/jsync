@@ -5,6 +5,7 @@ export {
   JSYNC_HEADER,
   Message,
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -22,6 +23,8 @@ export type { JsyncErrorCode, JsyncErrorOptions } from './error.js';
 export type {
   Action,
   AddAction,
+  ArrayPatchAction,
+  ArrayPatchEdit,
   CopyAction,
   MoveAction,
   PathSegment,

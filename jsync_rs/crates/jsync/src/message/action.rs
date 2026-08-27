@@ -1,5 +1,16 @@
 use serde_json::Value;
 
+/// One edit in an array patch action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayPatchEdit {
+    /// Start index, measured against the original array.
+    pub start: usize,
+    /// Number of elements to delete from the original array.
+    pub delete_count: usize,
+    /// Values to insert at start after deletion.
+    pub values: Vec<Value>,
+}
+
 /// One edit in a string patch action.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StringPatchEdit {
@@ -58,6 +69,13 @@ pub enum Action {
         path: Vec<PathSegment>,
         /// Edits in descending Unicode scalar offset order.
         edits: Vec<StringPatchEdit>,
+    },
+    /// Applies local edits to an existing array value at the given path.
+    ArrayPatch {
+        /// The validated path of the array to patch.
+        path: Vec<PathSegment>,
+        /// Edits in descending original array index order.
+        edits: Vec<ArrayPatchEdit>,
     },
     /// Copies an existing JSON value to another path.
     Copy {

@@ -4,12 +4,12 @@ use ciborium::Value as CborValue;
 
 use super::json_cbor::{integer, json_to_cbor, to_json};
 use super::opcode::{
-    OPCODE_ADD, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE, OPCODE_SNAPSHOT,
-    OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
+    OPCODE_ADD, OPCODE_ARRAY_PATCH, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE,
+    OPCODE_SNAPSHOT, OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
 };
 use super::{
-    Action, ConsumerPathSegmentPoolTransaction, PathSegment, ProducerPathSegmentPoolTransaction,
-    StringPatchEdit,
+    Action, ArrayPatchEdit, ConsumerPathSegmentPoolTransaction, PathSegment,
+    ProducerPathSegmentPoolTransaction, StringPatchEdit,
 };
 use crate::error::{JsyncError, JsyncErrorKind};
 
@@ -282,6 +282,20 @@ fn parse_action(
                     .map_err(|error| error.with_context("while decoding the STRING_PATCH edits"))?;
             Ok(Action::StringPatch { path, edits })
         }
+        opcode if opcode == i128::from(OPCODE_ARRAY_PATCH) => {
+            require_action_length(action.len(), 3)?;
+            let mut elements = action.into_iter();
+            let _opcode = elements.next();
+            let path = parse_pooled_path_with_txn(
+                elements.next().expect("validated array patch length"),
+                txn,
+            )
+            .map_err(|error| error.with_context("while parsing the ARRAY_PATCH path"))?;
+            let edits =
+                parse_array_patch_edits(elements.next().expect("validated array patch length"))
+                    .map_err(|error| error.with_context("while decoding the ARRAY_PATCH edits"))?;
+            Ok(Action::ArrayPatch { path, edits })
+        }
         opcode if opcode == i128::from(OPCODE_COPY) => {
             require_action_length(action.len(), 3)?;
             let mut elements = action.into_iter();
@@ -475,6 +489,80 @@ fn parse_string_patch_edit(value: CborValue) -> Result<StringPatchEdit, JsyncErr
     })
 }
 
+fn parse_array_patch_edits(value: CborValue) -> Result<Vec<ArrayPatchEdit>, JsyncError> {
+    let edits = match value {
+        CborValue::Array(edits) => edits,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "The ARRAY_PATCH edits must be an array.",
+            ));
+        }
+    };
+    if edits.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The ARRAY_PATCH edits cannot be empty.",
+        ));
+    }
+
+    edits
+        .into_iter()
+        .enumerate()
+        .map(|(edit_index, edit)| {
+            parse_array_patch_edit(edit).map_err(|error| {
+                error
+                    .with_metadata("edit_index", edit_index.to_string())
+                    .with_context("while decoding an ARRAY_PATCH edit")
+            })
+        })
+        .collect()
+}
+
+fn parse_array_patch_edit(value: CborValue) -> Result<ArrayPatchEdit, JsyncError> {
+    let edit = match value {
+        CborValue::Array(edit) => edit,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "An ARRAY_PATCH edit must be an array.",
+            ));
+        }
+    };
+    require_action_length(edit.len(), 3)?;
+
+    let mut elements = edit.into_iter();
+    let start = parse_usize(elements.next().expect("validated array patch edit length"))
+        .map_err(|error| error.with_context("while decoding the ARRAY_PATCH edit start"))?;
+    let delete_count = parse_usize(elements.next().expect("validated array patch edit length"))
+        .map_err(|error| error.with_context("while decoding the ARRAY_PATCH edit delete count"))?;
+    let values = match elements.next().expect("validated array patch edit length") {
+        CborValue::Array(values) => values
+            .into_iter()
+            .map(to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.with_context("while decoding the ARRAY_PATCH edit values"))?,
+        _ => {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "The ARRAY_PATCH edit values must be an array.",
+            ));
+        }
+    };
+    if delete_count == 0 && values.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "An ARRAY_PATCH edit must delete or insert values.",
+        ));
+    }
+
+    Ok(ArrayPatchEdit {
+        start,
+        delete_count,
+        values,
+    })
+}
+
 fn parse_usize(value: CborValue) -> Result<usize, JsyncError> {
     let CborValue::Integer(integer) = value else {
         return Err(JsyncError::new(
@@ -555,6 +643,27 @@ fn action_to_cbor(
                         ])
                     })
                     .collect(),
+            ),
+        ])),
+        Action::ArrayPatch { path, edits } => Ok(CborValue::Array(vec![
+            integer(OPCODE_ARRAY_PATCH),
+            pooled_path_to_cbor(txn, path),
+            CborValue::Array(
+                edits
+                    .iter()
+                    .map(|edit| {
+                        Ok(CborValue::Array(vec![
+                            integer(edit.start as u64),
+                            integer(edit.delete_count as u64),
+                            CborValue::Array(
+                                edit.values
+                                    .iter()
+                                    .map(json_to_cbor)
+                                    .collect::<Result<Vec<_>, _>>()?,
+                            ),
+                        ]))
+                    })
+                    .collect::<Result<Vec<_>, JsyncError>>()?,
             ),
         ])),
         Action::Copy { from, path } => Ok(CborValue::Array(vec![

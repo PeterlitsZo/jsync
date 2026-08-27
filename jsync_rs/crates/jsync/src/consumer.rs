@@ -1,7 +1,9 @@
 use serde_json::Value;
 
 use crate::error::{JsyncError, JsyncErrorKind};
-use crate::message::{Action, ConsumerPathSegmentPool, Message, PathSegment, StringPatchEdit};
+use crate::message::{
+    Action, ArrayPatchEdit, ConsumerPathSegmentPool, Message, PathSegment, StringPatchEdit,
+};
 
 /// Consumes Jsync messages and maintains the current JSON document.
 #[derive(Debug, Default)]
@@ -76,6 +78,7 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
         Action::StringAppend { path, text } => apply_string_append(root, &path, &text),
         Action::StringPrepend { path, text } => apply_string_prepend(root, &path, &text),
         Action::StringPatch { path, edits } => apply_string_patch(root, &path, &edits),
+        Action::ArrayPatch { path, edits } => apply_array_patch(root, &path, &edits),
         Action::Copy { from, path } => apply_copy(root, &from, &path),
         Action::Move { from, path } => apply_move(root, &from, &path),
     }
@@ -383,6 +386,82 @@ fn validate_string_patch_edits(
                 return Err(JsyncError::new(
                     JsyncErrorKind::InvalidJsonValue,
                     "STRING_PATCH edits must be in descending, non-overlapping order.",
+                )
+                .with_metadata("edit_index", edit_index.to_string()));
+            }
+        }
+        previous_start = Some(edit.start);
+    }
+
+    Ok(())
+}
+
+/// Applies local edits to an existing array at an object, array, or root path.
+fn apply_array_patch(
+    root: &mut Value,
+    path: &[PathSegment],
+    edits: &[ArrayPatchEdit],
+) -> Result<(), JsyncError> {
+    let target = resolve_value(root, path)
+        .map_err(|error| error.with_context("while resolving an ARRAY_PATCH path target"))?;
+    let Value::Array(target) = target else {
+        return Err(JsyncError::new(
+            JsyncErrorKind::ApplyFailed,
+            "The ARRAY_PATCH path target is not an array.",
+        )
+        .with_context("while applying the ARRAY_PATCH action"));
+    };
+
+    validate_array_patch_edits(edits, target.len())?;
+    for edit in edits {
+        let end = edit.start + edit.delete_count;
+        target.splice(edit.start..end, edit.values.clone());
+    }
+    Ok(())
+}
+
+fn validate_array_patch_edits(
+    edits: &[ArrayPatchEdit],
+    array_len: usize,
+) -> Result<(), JsyncError> {
+    if edits.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The ARRAY_PATCH edits cannot be empty.",
+        ));
+    }
+
+    let mut previous_start = None;
+    for (edit_index, edit) in edits.iter().enumerate() {
+        if edit.delete_count == 0 && edit.values.is_empty() {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "An ARRAY_PATCH edit must delete or insert values.",
+            )
+            .with_metadata("edit_index", edit_index.to_string()));
+        }
+        let end = edit.start.checked_add(edit.delete_count).ok_or_else(|| {
+            JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "An ARRAY_PATCH edit range is too large.",
+            )
+            .with_metadata("edit_index", edit_index.to_string())
+        })?;
+        if edit.start > array_len || end > array_len {
+            return Err(JsyncError::new(
+                JsyncErrorKind::ArrayIndexOutOfBounds,
+                "An ARRAY_PATCH edit range is outside the target array.",
+            )
+            .with_metadata("edit_index", edit_index.to_string())
+            .with_metadata("start", edit.start.to_string())
+            .with_metadata("delete_count", edit.delete_count.to_string())
+            .with_metadata("length", array_len.to_string()));
+        }
+        if let Some(previous_start) = previous_start {
+            if edit.start >= previous_start || end > previous_start {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidJsonValue,
+                    "ARRAY_PATCH edits must be in descending, non-overlapping order.",
                 )
                 .with_metadata("edit_index", edit_index.to_string()));
             }

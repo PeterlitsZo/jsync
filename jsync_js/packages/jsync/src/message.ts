@@ -1,6 +1,7 @@
 export { JSYNC_HEADER, Message } from './message/codec.js';
 export {
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -19,6 +20,8 @@ export {
 export type {
   Action,
   AddAction,
+  ArrayPatchAction,
+  ArrayPatchEdit,
   CopyAction,
   MoveAction,
   PathSegment,

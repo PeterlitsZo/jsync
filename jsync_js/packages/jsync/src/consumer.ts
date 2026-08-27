@@ -3,6 +3,7 @@ import {
   ConsumerPathSegmentPool,
   Message,
   OPCODE_ADD,
+  OPCODE_ARRAY_PATCH,
   OPCODE_COPY,
   OPCODE_MOVE,
   OPCODE_REMOVE,
@@ -13,7 +14,7 @@ import {
   OPCODE_STRING_PREPEND,
 } from './message.js';
 import { cloneJson, setOwn } from './value.js';
-import type { Action, PathSegment, StringPatchEdit } from './message.js';
+import type { Action, ArrayPatchEdit, PathSegment, StringPatchEdit } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
 
 /** Consumes Jsync messages and maintains the current JSON document. */
@@ -92,6 +93,9 @@ function applyAction(root: JsonValue | undefined, action: Action): JsonValue {
   }
   if (action.type === OPCODE_STRING_PATCH) {
     return applyStringPatch(root, action.path, action.edits);
+  }
+  if (action.type === OPCODE_ARRAY_PATCH) {
+    return applyArrayPatch(root, action.path, action.edits);
   }
   if (action.type === OPCODE_COPY) return applyCopy(root, action.from, action.path);
   if (action.type === OPCODE_MOVE) return applyMove(root, action.from, action.path);
@@ -417,6 +421,95 @@ function validateStringPatchEdits(
   }
 }
 
+/** Applies a splice-style patch to an existing array value. */
+function applyArrayPatch(
+  root: JsonValue | undefined,
+  path: PathSegment[],
+  edits: readonly ArrayPatchEdit[],
+): JsonValue {
+  if (path.length === 0) {
+    if (!Array.isArray(root)) {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'The ARRAY_PATCH path target is not an array.',
+      ).withContext('while applying the ARRAY_PATCH action');
+    }
+    return applyArrayPatchToValue(root, edits);
+  }
+
+  const target = resolveActionValue(root, path, 'ARRAY_PATCH');
+  if (!Array.isArray(target.value)) {
+    throw new JsyncError(
+      JsyncErrorKind.ApplyFailed,
+      'The ARRAY_PATCH path target is not an array.',
+    ).withContext('while applying the ARRAY_PATCH action');
+  }
+  target.set(applyArrayPatchToValue(target.value, edits));
+  return root as JsonValue;
+}
+
+function applyArrayPatchToValue(
+  value: JsonValue[],
+  edits: readonly ArrayPatchEdit[],
+): JsonValue[] {
+  validateArrayPatchEdits(edits, value.length);
+  for (const edit of edits) {
+    value.splice(
+      edit.start,
+      edit.deleteCount,
+      ...edit.values.map((child) => cloneJson(child) as JsonValue),
+    );
+  }
+  return value;
+}
+
+function validateArrayPatchEdits(
+  edits: readonly ArrayPatchEdit[],
+  arrayLength: number,
+): void {
+  if (edits.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'The ARRAY_PATCH edits cannot be empty.',
+    );
+  }
+
+  let previousStart: number | undefined;
+  for (const [editIndex, edit] of edits.entries()) {
+    const end = edit.start + edit.deleteCount;
+    if (edit.deleteCount === 0 && edit.values.length === 0) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'An ARRAY_PATCH edit must delete or insert values.',
+      ).withMetadata('edit_index', editIndex);
+    }
+    if (end > arrayLength) {
+      throw new JsyncError(
+        JsyncErrorKind.ArrayIndexOutOfBounds,
+        'An ARRAY_PATCH edit range is outside the target array.',
+      )
+        .withMetadata('start', edit.start)
+        .withMetadata('delete_count', edit.deleteCount)
+        .withMetadata('length', arrayLength)
+        .withMetadata('edit_index', editIndex);
+    }
+    if (
+      previousStart !== undefined &&
+      (edit.start >= previousStart || end > previousStart)
+    ) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'ARRAY_PATCH edits must be in descending, non-overlapping order.',
+      )
+        .withMetadata('start', edit.start)
+        .withMetadata('end', end)
+        .withMetadata('previous_start', previousStart)
+        .withMetadata('edit_index', editIndex);
+    }
+    previousStart = edit.start;
+  }
+}
+
 /** Copies an existing JSON value to an object, array, or root path. */
 function applyCopy(
   root: JsonValue | undefined,
@@ -574,7 +667,7 @@ function removeAndReturn(root: JsonValue | undefined, path: PathSegment[]): Json
 }
 
 type ContainerOperation = 'ADD' | 'REMOVE' | 'REPLACE' | 'APPEND' | 'PREPEND' | 'MOVE';
-type ValueOperation = 'APPEND' | 'PREPEND' | 'STRING_PATCH' | 'COPY';
+type ValueOperation = 'APPEND' | 'PREPEND' | 'STRING_PATCH' | 'ARRAY_PATCH' | 'COPY';
 
 /** Resolves an existing object or array container for an action parent path. */
 function resolveActionContainer(
