@@ -1,4 +1,6 @@
-use jsync::{Action, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool};
+use jsync::{
+    Action, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool, StringPatchEdit,
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -380,6 +382,249 @@ fn producer_emits_copy_and_move_actions_for_reused_object_values() {
             },
         ])
     );
+}
+
+#[test]
+fn producer_emits_string_patch_for_middle_insert() {
+    let old = format!("{}{}", "a".repeat(80), "b".repeat(80));
+    let new = format!("{}XYZ{}", "a".repeat(80), "b".repeat(80));
+    let decoded = producer_update_message(json!({"text": old}), json!({"text": new}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::StringPatch {
+            path: vec![key("text")],
+            edits: vec![StringPatchEdit {
+                start: 80,
+                delete_count: 0,
+                text: "XYZ".to_string(),
+            }],
+        }])
+    );
+}
+
+#[test]
+fn producer_emits_string_patch_for_middle_delete() {
+    let old = format!("{}XYZ{}", "a".repeat(80), "b".repeat(80));
+    let new = format!("{}{}", "a".repeat(80), "b".repeat(80));
+    let decoded = producer_update_message(json!({"text": old}), json!({"text": new}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::StringPatch {
+            path: vec![key("text")],
+            edits: vec![StringPatchEdit {
+                start: 80,
+                delete_count: 3,
+                text: String::new(),
+            }],
+        }])
+    );
+}
+
+#[test]
+fn producer_emits_string_patch_with_multiple_myers_edits() {
+    let old = format!("{}x{}y{}", "a".repeat(80), "b".repeat(80), "c".repeat(80));
+    let new = format!("{}X{}Y{}", "a".repeat(80), "b".repeat(80), "c".repeat(80));
+    let decoded = producer_update_message(json!({"text": old}), json!({"text": new}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::StringPatch {
+            path: vec![key("text")],
+            edits: vec![
+                StringPatchEdit {
+                    start: 161,
+                    delete_count: 1,
+                    text: "Y".to_string(),
+                },
+                StringPatchEdit {
+                    start: 80,
+                    delete_count: 1,
+                    text: "X".to_string(),
+                },
+            ],
+        }])
+    );
+}
+
+#[test]
+fn producer_string_patch_uses_unicode_scalar_offsets() {
+    let prefix = "😀".repeat(40);
+    let old = format!("{prefix}middle{}", "🚀".repeat(40));
+    let new = format!("{prefix}XYZmiddle{}", "🚀".repeat(40));
+    let decoded = producer_update_message(json!({"text": old}), json!({"text": new}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::StringPatch {
+            path: vec![key("text")],
+            edits: vec![StringPatchEdit {
+                start: 40,
+                delete_count: 0,
+                text: "XYZ".to_string(),
+            }],
+        }])
+    );
+}
+
+#[test]
+fn producer_replaces_completely_different_large_strings() {
+    let old = "a".repeat(12_000);
+    let new = "b".repeat(12_000);
+    let decoded = producer_update_message(json!({"text": old}), json!({"text": new.clone()}));
+
+    assert_eq!(
+        decoded,
+        Message::new(vec![Action::Replace {
+            path: vec![key("text")],
+            value: json!(new),
+        }])
+    );
+}
+
+#[test]
+fn string_patch_message_round_trips_and_applies() {
+    let message = Message::new(vec![
+        Action::Snapshot {
+            value: json!({"text": "abc def ghi"}),
+        },
+        Action::StringPatch {
+            path: vec![key("text")],
+            edits: vec![
+                StringPatchEdit {
+                    start: 9,
+                    delete_count: 2,
+                    text: "Y".to_string(),
+                },
+                StringPatchEdit {
+                    start: 2,
+                    delete_count: 1,
+                    text: "X".to_string(),
+                },
+            ],
+        },
+    ]);
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let bytes = encode_message(&mut encode_pool, &message);
+    let mut consumer = Consumer::new();
+
+    assert_eq!(
+        consumer
+            .decode_message_dry_run(&bytes)
+            .expect("string patch message should decode"),
+        message
+    );
+    consumer
+        .consume(&bytes)
+        .expect("string patch message should apply");
+    assert_eq!(consumer.document(), Some(&json!({"text": "abX def gY"})));
+}
+
+#[test]
+fn invalid_string_patch_edits_do_not_commit_document_or_path_pool() {
+    for edits in [
+        Vec::<StringPatchEdit>::new(),
+        vec![StringPatchEdit {
+            start: 1,
+            delete_count: 0,
+            text: String::new(),
+        }],
+        vec![StringPatchEdit {
+            start: 7,
+            delete_count: 0,
+            text: "x".to_string(),
+        }],
+        vec![
+            StringPatchEdit {
+                start: 1,
+                delete_count: 1,
+                text: "x".to_string(),
+            },
+            StringPatchEdit {
+                start: 3,
+                delete_count: 1,
+                text: "y".to_string(),
+            },
+        ],
+        vec![
+            StringPatchEdit {
+                start: 3,
+                delete_count: 2,
+                text: String::new(),
+            },
+            StringPatchEdit {
+                start: 2,
+                delete_count: 2,
+                text: String::new(),
+            },
+        ],
+    ] {
+        assert_invalid_string_patch_rolls_back(edits);
+    }
+}
+
+fn producer_update_message(initial: Value, update: Value) -> Message {
+    let mut producer = Producer::new(initial);
+    let mut inspector = Consumer::new();
+    let initial_message = producer
+        .get_message()
+        .expect("initial message should encode")
+        .expect("initial snapshot should exist");
+    inspector
+        .consume(&initial_message)
+        .expect("inspector should accept initial snapshot");
+
+    producer.update(update);
+    let message = producer
+        .get_message()
+        .expect("update message should encode")
+        .expect("update message should exist");
+    let decoded = inspector
+        .decode_message_dry_run(&message)
+        .expect("update message should decode");
+    inspector
+        .consume(&message)
+        .expect("inspector should consume update message");
+    assert_eq!(inspector.document(), Some(producer.document()));
+    decoded
+}
+
+fn assert_invalid_string_patch_rolls_back(edits: Vec<StringPatchEdit>) {
+    let mut consumer = Consumer::new();
+    let mut encode_pool = ProducerPathSegmentPool::new();
+    let initial = Message::new(vec![Action::Snapshot {
+        value: json!({"text": "abcdef"}),
+    }]);
+    let initial_bytes = encode_message(&mut encode_pool, &initial);
+    consumer
+        .consume(&initial_bytes)
+        .expect("initial snapshot should apply");
+
+    let invalid = Message::new(vec![Action::StringPatch {
+        path: vec![key("text")],
+        edits,
+    }]);
+    let invalid_bytes = encode_message(&mut encode_pool, &invalid);
+    assert!(consumer.consume(&invalid_bytes).is_err());
+    assert_eq!(consumer.document(), Some(&json!({"text": "abcdef"})));
+
+    let pooled_path_followup = Message::new(vec![Action::StringAppend {
+        path: vec![key("text")],
+        text: "!".to_string(),
+    }]);
+    let pooled_path_followup_bytes = encode_message(&mut encode_pool, &pooled_path_followup);
+    assert!(consumer.consume(&pooled_path_followup_bytes).is_err());
+    assert_eq!(consumer.document(), Some(&json!({"text": "abcdef"})));
+}
+
+fn encode_message(encode_pool: &mut ProducerPathSegmentPool, message: &Message) -> Vec<u8> {
+    let mut encode_txn = encode_pool.transaction();
+    let bytes = message
+        .to_bytes_with_pool_txn(&mut encode_txn)
+        .expect("message should encode");
+    encode_txn.commit();
+    bytes
 }
 
 fn key(value: &str) -> PathSegment {

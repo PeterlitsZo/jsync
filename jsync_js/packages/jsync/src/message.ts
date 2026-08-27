@@ -7,6 +7,7 @@ export {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
 } from './message/opcode.js';
 export {
@@ -25,5 +26,7 @@ export type {
   ReplaceAction,
   SnapshotAction,
   StringAppendAction,
+  StringPatchAction,
+  StringPatchEdit,
   StringPrependAction,
 } from './message/action.js';

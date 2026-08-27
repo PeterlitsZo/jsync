@@ -6,6 +6,7 @@ import {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
   ProducerPathSegmentPool,
 } from '../message.js';
@@ -105,6 +106,20 @@ class CostEstimator {
         + cborUnsignedIntegerLength(action.type)
         + this.estimatePathLength(action.path)
         + cborTextLength(action.text);
+    }
+    if (action.type === OPCODE_STRING_PATCH) {
+      return cborArrayHeaderLength(3)
+        + cborUnsignedIntegerLength(OPCODE_STRING_PATCH)
+        + this.estimatePathLength(action.path)
+        + cborArrayHeaderLength(action.edits.length)
+        + action.edits.reduce<number>(
+          (total, edit) => total
+            + cborArrayHeaderLength(3)
+            + cborUnsignedIntegerLength(edit.start)
+            + cborUnsignedIntegerLength(edit.deleteCount)
+            + cborTextLength(edit.text),
+          0,
+        );
     }
     return cborArrayHeaderLength(3)
       + cborUnsignedIntegerLength(action.type)

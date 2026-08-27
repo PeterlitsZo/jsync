@@ -1,5 +1,16 @@
 use serde_json::Value;
 
+/// One edit in a string patch action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringPatchEdit {
+    /// Start offset in Unicode scalar values, measured against the original string.
+    pub start: usize,
+    /// Number of Unicode scalar values to delete from the original string.
+    pub delete_count: usize,
+    /// Text to insert at start after deletion.
+    pub text: String,
+}
+
 /// A structured Jsync action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -40,6 +51,13 @@ pub enum Action {
         path: Vec<PathSegment>,
         /// The text to prepend.
         text: String,
+    },
+    /// Applies local edits to an existing string value at the given path.
+    StringPatch {
+        /// The validated path of the string to patch.
+        path: Vec<PathSegment>,
+        /// Edits in descending Unicode scalar offset order.
+        edits: Vec<StringPatchEdit>,
     },
     /// Copies an existing JSON value to another path.
     Copy {

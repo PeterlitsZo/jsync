@@ -1,4 +1,4 @@
-import { JsyncError, JsyncErrorKind } from '../error.js';
+import { ensureJsyncError, JsyncError, JsyncErrorKind } from '../error.js';
 import { normalizeJson } from '../value.js';
 import type { JsonValue } from '../value.js';
 import {
@@ -9,6 +9,7 @@ import {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
 } from './opcode.js';
 
@@ -55,6 +56,23 @@ export interface StringPrependAction {
   readonly text: string;
 }
 
+/** One edit in a string patch action. */
+export interface StringPatchEdit {
+  /** Start offset in Unicode scalar values, measured against the original string. */
+  readonly start: number;
+  /** Number of Unicode scalar values to delete from the original string. */
+  readonly deleteCount: number;
+  /** Text to insert at start after deletion. */
+  readonly text: string;
+}
+
+/** A validated STRING_PATCH action. */
+export interface StringPatchAction {
+  readonly type: typeof OPCODE_STRING_PATCH;
+  readonly path: PathSegment[];
+  readonly edits: StringPatchEdit[];
+}
+
 /** A validated COPY action. */
 export interface CopyAction {
   readonly type: typeof OPCODE_COPY;
@@ -77,6 +95,7 @@ export type Action =
   | ReplaceAction
   | StringAppendAction
   | StringPrependAction
+  | StringPatchAction
   | CopyAction
   | MoveAction;
 
@@ -105,6 +124,56 @@ export function parseText(value: unknown): string {
   throw new JsyncError(
     JsyncErrorKind.InvalidJsonValue,
     'The string patch text must be a CBOR text string.',
+  );
+}
+
+export function parseStringPatchEdits(value: unknown): StringPatchEdit[] {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'The STRING_PATCH edits must be an array.',
+    );
+  }
+  return value.map((edit: unknown, editIndex: number) => {
+    try {
+      return parseStringPatchEdit(edit);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error)
+        .withMetadata('edit_index', editIndex)
+        .withContext('while decoding a STRING_PATCH edit');
+    }
+  });
+}
+
+function parseStringPatchEdit(value: unknown): StringPatchEdit {
+  if (!Array.isArray(value)) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidJsonValue,
+      'A STRING_PATCH edit must be an array.',
+    );
+  }
+  if (value.length !== 3) {
+    throw new JsyncError(
+      JsyncErrorKind.InvalidActionLength,
+      'The Jsync action has an invalid number of elements.',
+    )
+      .withMetadata('expected', 3)
+      .withMetadata('actual', value.length);
+  }
+  return {
+    start: parseNonNegativeInteger(value[0]),
+    deleteCount: parseNonNegativeInteger(value[1]),
+    text: parseText(value[2]),
+  };
+}
+
+function parseNonNegativeInteger(value: unknown): number {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  throw new JsyncError(
+    JsyncErrorKind.InvalidJsonValue,
+    'The value must be a non-negative integer.',
   );
 }
 
@@ -141,6 +210,15 @@ export function normalizeAction(action: Action): Action {
       type: OPCODE_STRING_PREPEND,
       path: parsePath(action.path),
       text: parseText(action.text),
+    };
+  }
+  if (action.type === OPCODE_STRING_PATCH) {
+    return {
+      type: OPCODE_STRING_PATCH,
+      path: parsePath(action.path),
+      edits: parseStringPatchEdits(
+        action.edits.map((edit) => [edit.start, edit.deleteCount, edit.text]),
+      ),
     };
   }
   if (action.type === OPCODE_COPY) {

@@ -1,8 +1,14 @@
 import { Decoder, Encoder } from 'cbor-x';
 import { ensureJsyncError, JsyncError, JsyncErrorKind } from '../error.js';
 import { cloneJson, normalizeJson } from '../value.js';
-import { parsePath, parseText, cloneAction, normalizeAction } from './action.js';
-import type { Action, PathSegment } from './action.js';
+import {
+  parsePath,
+  parseText,
+  parseStringPatchEdits,
+  cloneAction,
+  normalizeAction,
+} from './action.js';
+import type { Action, PathSegment, StringPatchEdit } from './action.js';
 import {
   OPCODE_ADD,
   OPCODE_COPY,
@@ -11,6 +17,7 @@ import {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
 } from './opcode.js';
 import type {
@@ -291,6 +298,22 @@ function parseAction(value: unknown, transaction: ConsumerPathSegmentPoolTransac
     }
     return { type: OPCODE_STRING_PREPEND, path, text };
   }
+  if (opcode === OPCODE_STRING_PATCH) {
+    requireActionLength(value.length, 3);
+    let path: PathSegment[];
+    try {
+      path = parsePooledPath(value[1], transaction);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while parsing the STRING_PATCH path');
+    }
+    let edits: StringPatchEdit[];
+    try {
+      edits = parseStringPatchEdits(value[2]);
+    } catch (error: unknown) {
+      throw ensureJsyncError(error).withContext('while decoding the STRING_PATCH edits');
+    }
+    return { type: OPCODE_STRING_PATCH, path, edits };
+  }
   if (opcode === OPCODE_COPY) {
     requireActionLength(value.length, 3);
     let from: PathSegment[];
@@ -391,6 +414,13 @@ function encodeAction(action: Action, transaction: ProducerPathSegmentPoolTransa
   }
   if (action.type === OPCODE_STRING_APPEND || action.type === OPCODE_STRING_PREPEND) {
     return [action.type, transaction.encodePath(action.path), action.text];
+  }
+  if (action.type === OPCODE_STRING_PATCH) {
+    return [
+      OPCODE_STRING_PATCH,
+      transaction.encodePath(action.path),
+      action.edits.map((edit) => [edit.start, edit.deleteCount, edit.text]),
+    ];
   }
   return [
     action.type,

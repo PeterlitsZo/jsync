@@ -5,17 +5,21 @@ import {
   OPCODE_REMOVE,
   OPCODE_REPLACE,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
   ProducerPathSegmentPool,
 } from '../message.js';
 import { cloneJson } from '../value.js';
 import { plan } from './cost.js';
 import { digestValue } from './digest.js';
-import type { Action, PathSegment } from '../message.js';
+import type { Action, PathSegment, StringPatchEdit } from '../message.js';
 import type { JsonObject, JsonValue } from '../value.js';
 
 type DigestIndex = Map<string, string[]>;
 type KeyDigestIndex = Map<string, string>;
+
+const MYERS_MIDDLE_PRODUCT_THRESHOLD = 100_000;
+const MYERS_TRACE_CELL_THRESHOLD = 2_000_000;
 
 export interface DiffPlan {
   readonly actions: Action[];
@@ -303,7 +307,267 @@ function diffStrings(
     }
   }
 
+  if (old.length > 0) {
+    const oldIndex = next.indexOf(old);
+    if (oldIndex !== -1) {
+      const prefix = next.slice(0, oldIndex);
+      const suffix = next.slice(oldIndex + old.length);
+      if (prefix.length > 0 && suffix.length > 0) {
+        const prependAppend = plan(
+          [
+            { type: OPCODE_STRING_APPEND, path: [...path], text: suffix },
+            { type: OPCODE_STRING_PREPEND, path: [...path], text: prefix },
+          ],
+          pathSegmentPool,
+        );
+        if (prependAppend.cost < best.cost) best = prependAppend;
+      }
+    }
+  }
+
+  const oldTokens = stringTokens(old);
+  const newTokens = stringTokens(next);
+  const singlePatch = singleStringPatchPlan(oldTokens, newTokens, path, pathSegmentPool);
+  if (singlePatch !== undefined && singlePatch.cost < best.cost) best = singlePatch;
+
+  const myersPatch = myersStringPatchPlan(oldTokens, newTokens, path, pathSegmentPool);
+  if (myersPatch !== undefined && myersPatch.cost < best.cost) best = myersPatch;
+
   return best;
+}
+
+function stringTokens(value: string): string[] {
+  return Array.from(value);
+}
+
+function tokensToString(tokens: readonly string[]): string {
+  return tokens.join('');
+}
+
+function singleStringPatchPlan(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+  path: PathSegment[],
+  pathSegmentPool: ProducerPathSegmentPool,
+): DiffPlan | undefined {
+  const prefix = commonStringPrefixLength(oldTokens, newTokens);
+  const suffix = commonStringSuffixLength(oldTokens, newTokens, prefix);
+  const oldEnd = oldTokens.length - suffix;
+  const newEnd = newTokens.length - suffix;
+  const deleteCount = oldEnd - prefix;
+  const text = tokensToString(newTokens.slice(prefix, newEnd));
+  if (deleteCount === 0 && text.length === 0) return undefined;
+
+  return plan(
+    [
+      {
+        type: OPCODE_STRING_PATCH,
+        path: [...path],
+        edits: [{ start: prefix, deleteCount, text }],
+      },
+    ],
+    pathSegmentPool,
+  );
+}
+
+function myersStringPatchPlan(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+  path: PathSegment[],
+  pathSegmentPool: ProducerPathSegmentPool,
+): DiffPlan | undefined {
+  if (!shouldRunMyersStringDiff(oldTokens, newTokens)) return undefined;
+
+  const prefix = commonStringPrefixLength(oldTokens, newTokens);
+  const suffix = commonStringSuffixLength(oldTokens, newTokens, prefix);
+  const oldMiddle = oldTokens.slice(prefix, oldTokens.length - suffix);
+  const newMiddle = newTokens.slice(prefix, newTokens.length - suffix);
+  const ops = myersDiffStrings(oldMiddle, newMiddle);
+  const edits = stringEditOpsToPatchEdits(ops, newMiddle, prefix);
+  if (edits.length === 0) return undefined;
+
+  return plan(
+    [{ type: OPCODE_STRING_PATCH, path: [...path], edits }],
+    pathSegmentPool,
+  );
+}
+
+function commonStringPrefixLength(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+): number {
+  const max = Math.min(oldTokens.length, newTokens.length);
+  let index = 0;
+  while (index < max && oldTokens[index] === newTokens[index]) index += 1;
+  return index;
+}
+
+function commonStringSuffixLength(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+  prefixLength: number,
+): number {
+  const max = Math.min(oldTokens.length, newTokens.length) - prefixLength;
+  let suffix = 0;
+  while (
+    suffix < max &&
+    oldTokens[oldTokens.length - 1 - suffix] === newTokens[newTokens.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+  return suffix;
+}
+
+function shouldRunMyersStringDiff(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+): boolean {
+  const prefix = commonStringPrefixLength(oldTokens, newTokens);
+  const suffix = commonStringSuffixLength(oldTokens, newTokens, prefix);
+  const oldMiddleLength = oldTokens.length - prefix - suffix;
+  const newMiddleLength = newTokens.length - prefix - suffix;
+  if (oldMiddleLength === 0 || newMiddleLength === 0) return false;
+  if (oldMiddleLength * newMiddleLength > MYERS_MIDDLE_PRODUCT_THRESHOLD) return false;
+
+  const max = oldMiddleLength + newMiddleLength;
+  return (max + 1) * (2 * max + 3) <= MYERS_TRACE_CELL_THRESHOLD;
+}
+
+type StringEditOp =
+  | { readonly kind: 'keep' }
+  | { readonly kind: 'delete' }
+  | { readonly kind: 'insert'; readonly newIndex: number };
+
+function myersDiffStrings(
+  oldTokens: readonly string[],
+  newTokens: readonly string[],
+): StringEditOp[] {
+  const n = oldTokens.length;
+  const m = newTokens.length;
+  if (n === 0) return newTokens.map((_, newIndex) => ({ kind: 'insert', newIndex }));
+  if (m === 0) return Array.from({ length: n }, () => ({ kind: 'delete' }));
+
+  const max = n + m;
+  const offset = max + 1;
+  const trace: number[][] = [];
+  const v = Array<number>(2 * max + 3).fill(-1);
+  v[offset + 1] = 0;
+
+  for (let d = 0; d <= max; d += 1) {
+    for (let k = -d; k <= d; k += 2) {
+      const index = offset + k;
+      let x: number;
+      if (k === -d || (k !== d && v[index - 1] < v[index + 1])) {
+        x = v[index + 1];
+      } else {
+        x = v[index - 1] + 1;
+      }
+      let y = x - k;
+
+      while (x < n && y < m && oldTokens[x] === newTokens[y]) {
+        x += 1;
+        y += 1;
+      }
+
+      v[index] = x;
+      if (x >= n && y >= m) {
+        trace.push([...v]);
+        return backtrackMyersStringDiff(trace, d, n, m, offset);
+      }
+    }
+    trace.push([...v]);
+  }
+
+  throw new Error('Myers diff failed to find a string edit script.');
+}
+
+function backtrackMyersStringDiff(
+  trace: readonly number[][],
+  editDistance: number,
+  n: number,
+  m: number,
+  offset: number,
+): StringEditOp[] {
+  let x = n;
+  let y = m;
+  const ops: StringEditOp[] = [];
+
+  for (let d = editDistance; d >= 1; d -= 1) {
+    const k = x - y;
+    const previous = trace[d - 1];
+    const previousK = k === -d || (k !== d && previous[offset + k - 1] < previous[offset + k + 1])
+      ? k + 1
+      : k - 1;
+    const previousX = previous[offset + previousK];
+    const previousY = previousX - previousK;
+
+    while (x > previousX && y > previousY) {
+      ops.push({ kind: 'keep' });
+      x -= 1;
+      y -= 1;
+    }
+
+    if (x === previousX) {
+      ops.push({ kind: 'insert', newIndex: y - 1 });
+      y -= 1;
+    } else {
+      ops.push({ kind: 'delete' });
+      x -= 1;
+    }
+  }
+
+  while (x > 0 && y > 0) {
+    ops.push({ kind: 'keep' });
+    x -= 1;
+    y -= 1;
+  }
+
+  return ops.reverse();
+}
+
+function stringEditOpsToPatchEdits(
+  ops: readonly StringEditOp[],
+  newTokens: readonly string[],
+  prefixOffset: number,
+): StringPatchEdit[] {
+  const edits: StringPatchEdit[] = [];
+  let oldCursor = 0;
+  let hunkStart: number | undefined;
+  let deleteCount = 0;
+  const inserted: string[] = [];
+
+  const flush = () => {
+    if (hunkStart === undefined) return;
+    if (deleteCount > 0 || inserted.length > 0) {
+      edits.push({
+        start: hunkStart + prefixOffset,
+        deleteCount,
+        text: tokensToString(inserted),
+      });
+    }
+    hunkStart = undefined;
+    deleteCount = 0;
+    inserted.length = 0;
+  };
+
+  for (const op of ops) {
+    if (op.kind === 'keep') {
+      flush();
+      oldCursor += 1;
+      continue;
+    }
+    if (op.kind === 'delete') {
+      hunkStart ??= oldCursor;
+      deleteCount += 1;
+      oldCursor += 1;
+      continue;
+    }
+    hunkStart ??= oldCursor;
+    inserted.push(newTokens[op.newIndex]);
+  }
+
+  flush();
+  return edits.reverse();
 }
 
 function replacePlan(

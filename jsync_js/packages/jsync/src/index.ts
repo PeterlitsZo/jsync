@@ -11,6 +11,7 @@ export {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
   ProducerPathSegmentPool,
   ProducerPathSegmentPoolTransaction,
@@ -28,6 +29,8 @@ export type {
   ReplaceAction,
   SnapshotAction,
   StringAppendAction,
+  StringPatchAction,
+  StringPatchEdit,
   StringPrependAction,
 } from './message.js';
 export type {

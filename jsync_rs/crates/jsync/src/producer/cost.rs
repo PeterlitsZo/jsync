@@ -9,7 +9,7 @@ use crate::message::Message;
 use crate::message::{Action, PathSegment, ProducerPathSegmentPool};
 use crate::message::{
     OPCODE_ADD, OPCODE_COPY, OPCODE_MOVE, OPCODE_REMOVE, OPCODE_REPLACE, OPCODE_SNAPSHOT,
-    OPCODE_STRING_APPEND, OPCODE_STRING_PREPEND,
+    OPCODE_STRING_APPEND, OPCODE_STRING_PATCH, OPCODE_STRING_PREPEND,
 };
 
 pub(super) fn plan(
@@ -114,6 +114,19 @@ impl<'a> CostEstimator<'a> {
                 + cbor_uint_len(OPCODE_STRING_PREPEND)
                 + self.estimate_path_len(path)
                 + cbor_text_len(text)),
+            Action::StringPatch { path, edits } => Ok(cbor_array_header_len(3)
+                + cbor_uint_len(OPCODE_STRING_PATCH)
+                + self.estimate_path_len(path)
+                + cbor_array_header_len(edits.len())
+                + edits
+                    .iter()
+                    .map(|edit| {
+                        cbor_array_header_len(3)
+                            + cbor_uint_len(edit.start as u64)
+                            + cbor_uint_len(edit.delete_count as u64)
+                            + cbor_text_len(&edit.text)
+                    })
+                    .sum::<usize>()),
             Action::Copy { from, path } => Ok(cbor_array_header_len(3)
                 + cbor_uint_len(OPCODE_COPY)
                 + self.estimate_path_len(from)

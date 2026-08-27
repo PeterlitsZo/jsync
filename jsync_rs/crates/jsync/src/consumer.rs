@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::error::{JsyncError, JsyncErrorKind};
-use crate::message::{Action, ConsumerPathSegmentPool, Message, PathSegment};
+use crate::message::{Action, ConsumerPathSegmentPool, Message, PathSegment, StringPatchEdit};
 
 /// Consumes Jsync messages and maintains the current JSON document.
 #[derive(Debug, Default)]
@@ -75,6 +75,7 @@ fn apply_action(root: &mut Value, action: Action) -> Result<(), JsyncError> {
         Action::Replace { path, value } => apply_replace(root, &path, value),
         Action::StringAppend { path, text } => apply_string_append(root, &path, &text),
         Action::StringPrepend { path, text } => apply_string_prepend(root, &path, &text),
+        Action::StringPatch { path, edits } => apply_string_patch(root, &path, &edits),
         Action::Copy { from, path } => apply_copy(root, &from, &path),
         Action::Move { from, path } => apply_move(root, &from, &path),
     }
@@ -302,6 +303,93 @@ fn apply_string_prepend(
         .with_context("while applying the PREPEND action"));
     };
     target.insert_str(0, text);
+    Ok(())
+}
+
+/// Applies local edits to an existing string at an object, array, or root path.
+fn apply_string_patch(
+    root: &mut Value,
+    path: &[PathSegment],
+    edits: &[StringPatchEdit],
+) -> Result<(), JsyncError> {
+    let target = resolve_value(root, path)
+        .map_err(|error| error.with_context("while resolving a STRING_PATCH path target"))?;
+    let Value::String(target) = target else {
+        return Err(JsyncError::new(
+            JsyncErrorKind::ApplyFailed,
+            "The STRING_PATCH path target is not a string.",
+        )
+        .with_context("while applying the STRING_PATCH action"));
+    };
+
+    let scalar_to_byte = scalar_to_byte_offsets(target);
+    validate_string_patch_edits(edits, scalar_to_byte.len() - 1)?;
+
+    for edit in edits {
+        let start_byte = scalar_to_byte[edit.start];
+        let end_byte = scalar_to_byte[edit.start + edit.delete_count];
+        target.replace_range(start_byte..end_byte, &edit.text);
+    }
+    Ok(())
+}
+
+fn scalar_to_byte_offsets(value: &str) -> Vec<usize> {
+    value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .collect()
+}
+
+fn validate_string_patch_edits(
+    edits: &[StringPatchEdit],
+    scalar_len: usize,
+) -> Result<(), JsyncError> {
+    if edits.is_empty() {
+        return Err(JsyncError::new(
+            JsyncErrorKind::InvalidJsonValue,
+            "The STRING_PATCH edits cannot be empty.",
+        ));
+    }
+
+    let mut previous_start = None;
+    for (edit_index, edit) in edits.iter().enumerate() {
+        if edit.delete_count == 0 && edit.text.is_empty() {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "A STRING_PATCH edit must delete text or insert text.",
+            )
+            .with_metadata("edit_index", edit_index.to_string()));
+        }
+        let end = edit.start.checked_add(edit.delete_count).ok_or_else(|| {
+            JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "A STRING_PATCH edit range is too large.",
+            )
+            .with_metadata("edit_index", edit_index.to_string())
+        })?;
+        if edit.start > scalar_len || end > scalar_len {
+            return Err(JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "A STRING_PATCH edit range is outside the target string.",
+            )
+            .with_metadata("edit_index", edit_index.to_string())
+            .with_metadata("start", edit.start.to_string())
+            .with_metadata("delete_count", edit.delete_count.to_string())
+            .with_metadata("length", scalar_len.to_string()));
+        }
+        if let Some(previous_start) = previous_start {
+            if end > previous_start {
+                return Err(JsyncError::new(
+                    JsyncErrorKind::InvalidJsonValue,
+                    "STRING_PATCH edits must be in descending, non-overlapping order.",
+                )
+                .with_metadata("edit_index", edit_index.to_string()));
+            }
+        }
+        previous_start = Some(edit.start);
+    }
+
     Ok(())
 }
 

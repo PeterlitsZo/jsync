@@ -9,10 +9,11 @@ import {
   OPCODE_REPLACE,
   OPCODE_SNAPSHOT,
   OPCODE_STRING_APPEND,
+  OPCODE_STRING_PATCH,
   OPCODE_STRING_PREPEND,
 } from './message.js';
 import { cloneJson, setOwn } from './value.js';
-import type { Action, PathSegment } from './message.js';
+import type { Action, PathSegment, StringPatchEdit } from './message.js';
 import type { JsonObject, JsonValue } from './value.js';
 
 /** Consumes Jsync messages and maintains the current JSON document. */
@@ -88,6 +89,9 @@ function applyAction(root: JsonValue | undefined, action: Action): JsonValue {
   }
   if (action.type === OPCODE_STRING_PREPEND) {
     return applyStringPrepend(root, action.path, action.text);
+  }
+  if (action.type === OPCODE_STRING_PATCH) {
+    return applyStringPatch(root, action.path, action.edits);
   }
   if (action.type === OPCODE_COPY) return applyCopy(root, action.from, action.path);
   if (action.type === OPCODE_MOVE) return applyMove(root, action.from, action.path);
@@ -333,6 +337,86 @@ function applyStringPrepend(root: JsonValue | undefined, path: PathSegment[], te
   return root as JsonValue;
 }
 
+/** Applies a scalar-offset patch to an existing string value. */
+function applyStringPatch(
+  root: JsonValue | undefined,
+  path: PathSegment[],
+  edits: readonly StringPatchEdit[],
+): JsonValue {
+  if (path.length === 0) {
+    if (typeof root !== 'string') {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'The STRING_PATCH path target is not a string.',
+      ).withContext('while applying the STRING_PATCH action');
+    }
+    return applyStringPatchToValue(root, edits);
+  }
+
+  const target = resolveActionValue(root, path, 'STRING_PATCH');
+  if (typeof target.value !== 'string') {
+    throw new JsyncError(
+      JsyncErrorKind.ApplyFailed,
+      'The STRING_PATCH path target is not a string.',
+    ).withContext('while applying the STRING_PATCH action');
+  }
+  target.set(applyStringPatchToValue(target.value, edits));
+  return root as JsonValue;
+}
+
+function applyStringPatchToValue(value: string, edits: readonly StringPatchEdit[]): string {
+  const chars = Array.from(value);
+  validateStringPatchEdits(edits, chars.length);
+  for (const edit of edits) {
+    chars.splice(edit.start, edit.deleteCount, ...Array.from(edit.text));
+  }
+  return chars.join('');
+}
+
+function validateStringPatchEdits(
+  edits: readonly StringPatchEdit[],
+  scalarLength: number,
+): void {
+  if (edits.length === 0) {
+    throw new JsyncError(
+      JsyncErrorKind.ApplyFailed,
+      'A STRING_PATCH action must contain at least one edit.',
+    );
+  }
+
+  let previousStart: number | undefined;
+  for (const [editIndex, edit] of edits.entries()) {
+    const end = edit.start + edit.deleteCount;
+    if (edit.deleteCount === 0 && edit.text.length === 0) {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'A STRING_PATCH edit must either delete or insert text.',
+      ).withMetadata('edit_index', editIndex);
+    }
+    if (end > scalarLength) {
+      throw new JsyncError(
+        JsyncErrorKind.ArrayIndexOutOfBounds,
+        'A STRING_PATCH edit is outside the target string.',
+      )
+        .withMetadata('start', edit.start)
+        .withMetadata('delete_count', edit.deleteCount)
+        .withMetadata('length', scalarLength)
+        .withMetadata('edit_index', editIndex);
+    }
+    if (previousStart !== undefined && end > previousStart) {
+      throw new JsyncError(
+        JsyncErrorKind.ApplyFailed,
+        'STRING_PATCH edits must be sorted in descending order and must not overlap.',
+      )
+        .withMetadata('start', edit.start)
+        .withMetadata('end', end)
+        .withMetadata('previous_start', previousStart)
+        .withMetadata('edit_index', editIndex);
+    }
+    previousStart = edit.start;
+  }
+}
+
 /** Copies an existing JSON value to an object, array, or root path. */
 function applyCopy(
   root: JsonValue | undefined,
@@ -490,7 +574,7 @@ function removeAndReturn(root: JsonValue | undefined, path: PathSegment[]): Json
 }
 
 type ContainerOperation = 'ADD' | 'REMOVE' | 'REPLACE' | 'APPEND' | 'PREPEND' | 'MOVE';
-type ValueOperation = 'APPEND' | 'PREPEND' | 'COPY';
+type ValueOperation = 'APPEND' | 'PREPEND' | 'STRING_PATCH' | 'COPY';
 
 /** Resolves an existing object or array container for an action parent path. */
 function resolveActionContainer(
