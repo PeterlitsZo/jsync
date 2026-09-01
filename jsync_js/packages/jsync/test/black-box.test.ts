@@ -255,8 +255,8 @@ test('array patch fixture bytes are cross-language compatible', () => {
     },
   ]);
   const expectedBytes = Uint8Array.from([
-    217, 255, 1, 130, 129, 128, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131,
-    9, 128, 130, 131, 2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
+    217, 255, 1, 129, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131, 9,
+    128, 130, 131, 2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
   ]);
   const encodePool = new ProducerPathSegmentPool();
   const consumer = new Consumer();

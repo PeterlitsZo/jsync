@@ -39,13 +39,17 @@ function estimatePlanCost(
     0,
   );
 
-  // Wire payload shape is: HEADER + [metadata, actions], where metadata is a
-  // one-element array containing the path segment pool append list.
+  const metadataCost = estimator.appendedLength === 0
+    ? 0
+    : cborUnsignedIntegerLength(0)
+      + cborArrayHeaderLength(estimator.appendedLength)
+      + estimator.metadataSegmentsCost();
+
+  // Wire payload shape is: HEADER + [actions] or
+  // HEADER + [0, appended_path_segments, actions].
   return 3 // Jsync header.
-    + cborArrayHeaderLength(2)
-    + cborArrayHeaderLength(1)
-    + cborArrayHeaderLength(estimator.appendedLength)
-    + estimator.metadataSegmentsCost()
+    + cborArrayHeaderLength(estimator.appendedLength === 0 ? 1 : 3)
+    + metadataCost
     + cborArrayHeaderLength(actions.length)
     + actionsCost;
 }

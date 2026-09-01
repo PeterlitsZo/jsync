@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Cursor;
 
 use ciborium::Value as CborValue;
@@ -14,6 +15,7 @@ use super::{
 use crate::error::{JsyncError, JsyncErrorKind};
 
 const HEADER: [u8; 3] = [0xd9, 0xff, 0x01];
+const METADATA_PATH_SEGMENT_POOL_APPEND: i128 = 0;
 
 pub(super) fn from_bytes_with_pool_txn(
     bytes: &[u8],
@@ -31,16 +33,24 @@ pub(super) fn to_bytes_with_pool_txn(
         .map(|action| action_to_cbor(action, txn))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let metadata = CborValue::Array(vec![CborValue::Array(
-        txn.appended_segments()
-            .iter()
-            .map(|segment| match segment {
-                PathSegment::Key(key) => CborValue::Text(key.clone()),
-                PathSegment::Index(index) => integer(*index as u64),
-            })
-            .collect(),
-    )]);
-    let payload = CborValue::Array(vec![metadata, CborValue::Array(actions)]);
+    let appended_segments = txn
+        .appended_segments()
+        .iter()
+        .map(|segment| match segment {
+            PathSegment::Key(key) => CborValue::Text(key.clone()),
+            PathSegment::Index(index) => integer(*index as u64),
+        })
+        .collect::<Vec<_>>();
+    let actions = CborValue::Array(actions);
+    let payload = if appended_segments.is_empty() {
+        CborValue::Array(vec![actions])
+    } else {
+        CborValue::Array(vec![
+            integer(METADATA_PATH_SEGMENT_POOL_APPEND as u64),
+            CborValue::Array(appended_segments),
+            actions,
+        ])
+    };
 
     let mut bytes = HEADER.to_vec();
     ciborium::ser::into_writer(&payload, &mut bytes).map_err(|error| {
@@ -107,21 +117,20 @@ fn parse_message(
             ));
         }
     };
-    if message.len() != 2 {
+    if message.is_empty() || message.len() % 2 == 0 {
         return Err(JsyncError::new(
             JsyncErrorKind::InvalidActionLength,
-            "The Jsync message payload must contain metadata and actions.",
+            "The Jsync message payload must contain metadata tag/value pairs followed by actions.",
         )
-        .with_metadata("expected", "2")
+        .with_metadata("expected", "a non-empty odd length")
         .with_metadata("actual", message.len().to_string()));
     }
 
-    let mut elements = message.into_iter();
-    let to_append_path_segment_pool =
-        parse_metadata(elements.next().expect("validated message length"))?;
-    txn.append_segments(to_append_path_segment_pool);
+    let mut message = message;
+    let body = message.pop().expect("validated non-empty message");
+    parse_metadata_pairs(message, txn)?;
 
-    let actions = match elements.next().expect("validated message length") {
+    let actions = match body {
         CborValue::Array(actions) => actions,
         _ => {
             return Err(JsyncError::new(
@@ -143,31 +152,34 @@ fn parse_message(
         .collect()
 }
 
-fn parse_metadata(value: CborValue) -> Result<Vec<PathSegment>, JsyncError> {
-    let metadata = match value {
-        CborValue::Array(metadata) => metadata,
-        _ => {
-            return Err(JsyncError::new(
-                JsyncErrorKind::MessageNotArray,
-                "The Jsync metadata must be an array.",
-            ));
-        }
-    };
-    if metadata.len() != 1 {
-        return Err(JsyncError::new(
-            JsyncErrorKind::InvalidActionLength,
-            "The Jsync metadata must contain the path segment pool append list.",
-        )
-        .with_metadata("expected", "1")
-        .with_metadata("actual", metadata.len().to_string()));
-    }
+fn parse_metadata_pairs(
+    metadata: Vec<CborValue>,
+    txn: &mut ConsumerPathSegmentPoolTransaction<'_>,
+) -> Result<(), JsyncError> {
+    let mut seen_known_tags = HashSet::new();
+    for pair in metadata.chunks_exact(2) {
+        let tag = pair[0].as_integer().map(i128::from).ok_or_else(|| {
+            JsyncError::new(
+                JsyncErrorKind::InvalidJsonValue,
+                "A Jsync metadata tag must be an integer.",
+            )
+        })?;
 
-    parse_path_segments(
-        metadata
-            .into_iter()
-            .next()
-            .expect("validated metadata length"),
-    )
+        match tag {
+            METADATA_PATH_SEGMENT_POOL_APPEND => {
+                if !seen_known_tags.insert(tag) {
+                    return Err(JsyncError::new(
+                        JsyncErrorKind::InvalidActionLength,
+                        "A Jsync metadata tag must not appear more than once.",
+                    )
+                    .with_metadata("tag", tag.to_string()));
+                }
+                txn.append_segments(parse_path_segments(pair[1].clone())?);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_action(

@@ -31,6 +31,8 @@ import type { JsonValue } from '../value.js';
 /** The three-byte Jsync version 1 header. */
 export const JSYNC_HEADER = Uint8Array.from([0xd9, 0xff, 0x01]);
 
+const METADATA_PATH_SEGMENT_POOL_APPEND = 0;
+
 const decoder = new Decoder({ mapsAsObjects: false, useRecords: false });
 const encoder = new Encoder({ mapsAsObjects: false, useRecords: false });
 
@@ -62,7 +64,11 @@ export class Message {
   /** Encodes this message using a caller-owned producer path segment pool transaction. */
   toBytesWithPoolTxn(transaction: ProducerPathSegmentPoolTransaction): Uint8Array {
     const actions = this.#actions.map((action) => encodeAction(action, transaction));
-    const payload = encoder.encode([[transaction.appendedSegments()], actions]);
+    const appendedSegments = transaction.appendedSegments();
+    const payloadValue = appendedSegments.length === 0
+      ? [actions]
+      : [METADATA_PATH_SEGMENT_POOL_APPEND, appendedSegments, actions];
+    const payload = encoder.encode(payloadValue);
     const message = new Uint8Array(JSYNC_HEADER.length + payload.length);
     message.set(JSYNC_HEADER);
     message.set(payload, JSYNC_HEADER.length);
@@ -148,25 +154,25 @@ function parseMessage(
       'The Jsync message payload must be an array.',
     );
   }
-  if (value.length !== 2) {
+  if (value.length === 0 || value.length % 2 === 0) {
     throw new JsyncError(
       JsyncErrorKind.InvalidActionLength,
-      'The Jsync message payload must contain metadata and actions.',
+      'The Jsync message payload must contain metadata tag/value pairs followed by actions.',
     )
-      .withMetadata('expected', 2)
+      .withMetadata('expected', 'a non-empty odd length')
       .withMetadata('actual', value.length);
   }
 
-  const toAppendPathSegmentPool = parseMetadata(value[0]);
-  transaction.appendSegments(toAppendPathSegmentPool);
-  if (!Array.isArray(value[1])) {
+  parseMetadataPairs(value.slice(0, -1), transaction);
+  const body = value[value.length - 1];
+  if (!Array.isArray(body)) {
     throw new JsyncError(
       JsyncErrorKind.MessageNotArray,
       'The Jsync actions payload must be an array.',
     );
   }
 
-  return value[1].map((action: unknown, index: number) => {
+  return body.map((action: unknown, index: number) => {
     try {
       return parseAction(action, transaction);
     } catch (error: unknown) {
@@ -177,22 +183,32 @@ function parseMessage(
   });
 }
 
-function parseMetadata(value: unknown): PathSegment[] {
-  if (!Array.isArray(value)) {
-    throw new JsyncError(
-      JsyncErrorKind.MessageNotArray,
-      'The Jsync metadata must be an array.',
-    );
+function parseMetadataPairs(
+  metadata: unknown[],
+  transaction: ConsumerPathSegmentPoolTransaction,
+): void {
+  const seenKnownTags = new Set<number>();
+  for (let index = 0; index < metadata.length; index += 2) {
+    const tag = metadata[index];
+    if (typeof tag !== 'number' || !Number.isInteger(tag)) {
+      throw new JsyncError(
+        JsyncErrorKind.InvalidJsonValue,
+        'A Jsync metadata tag must be an integer.',
+      );
+    }
+
+    const metadataValue = metadata[index + 1];
+    if (tag === METADATA_PATH_SEGMENT_POOL_APPEND) {
+      if (seenKnownTags.has(tag)) {
+        throw new JsyncError(
+          JsyncErrorKind.InvalidActionLength,
+          'A Jsync metadata tag must not appear more than once.',
+        ).withMetadata('tag', tag);
+      }
+      seenKnownTags.add(tag);
+      transaction.appendSegments(parsePath(metadataValue));
+    }
   }
-  if (value.length !== 1) {
-    throw new JsyncError(
-      JsyncErrorKind.InvalidActionLength,
-      'The Jsync metadata must contain the path segment pool append list.',
-    )
-      .withMetadata('expected', 1)
-      .withMetadata('actual', value.length);
-  }
-  return parsePath(value[0]);
 }
 
 /** Validates one raw action without relying on its position in the message. */

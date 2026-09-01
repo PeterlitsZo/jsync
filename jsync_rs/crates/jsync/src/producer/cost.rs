@@ -37,13 +37,17 @@ fn estimate_plan_cost(
         .try_fold(0usize, |total, cost| Ok(total + cost?))?;
     let metadata_segments_cost = estimator.metadata_segments_cost()?;
 
-    // Wire payload shape is: HEADER + [metadata, actions], where metadata is a
-    // one-element array containing the path segment pool append list.
+    let metadata_cost = if estimator.appended_len() == 0 {
+        0
+    } else {
+        cbor_uint_len(0) + cbor_array_header_len(estimator.appended_len()) + metadata_segments_cost
+    };
+
+    // Wire payload shape is: HEADER + [actions] or
+    // HEADER + [0, appended_path_segments, actions].
     Ok(3 // Jsync header.
-        + cbor_array_header_len(2)
-        + cbor_array_header_len(1)
-        + cbor_array_header_len(estimator.appended_len())
-        + metadata_segments_cost
+        + cbor_array_header_len(if estimator.appended_len() == 0 { 1 } else { 3 })
+        + metadata_cost
         + cbor_array_header_len(actions.len())
         + actions_cost)
 }

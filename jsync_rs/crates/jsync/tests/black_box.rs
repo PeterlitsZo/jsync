@@ -114,7 +114,7 @@ fn producer_messages_keep_consumer_in_sync() {
                 path: vec![],
                 value: json!(["root replacement", {"revision": 4}, [1, 2, 3]]),
             }]),
-            expected_message_bytes_len: 43,
+            expected_message_bytes_len: 41,
         },
         UpdateCase {
             to_update: json!({
@@ -132,7 +132,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     "tags": ["systems"],
                 }),
             }]),
-            expected_message_bytes_len: 84,
+            expected_message_bytes_len: 82,
         },
         UpdateCase {
             to_update: json!({
@@ -165,7 +165,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     value: json!(["person", "male"]),
                 },
             ]),
-            expected_message_bytes_len: 50,
+            expected_message_bytes_len: 48,
         },
         UpdateCase {
             to_update: json!({
@@ -187,7 +187,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     value: json!(7),
                 },
             ]),
-            expected_message_bytes_len: 21,
+            expected_message_bytes_len: 19,
         },
         UpdateCase {
             to_update: json!({
@@ -217,7 +217,7 @@ fn producer_messages_keep_consumer_in_sync() {
                     }],
                 },
             ]),
-            expected_message_bytes_len: 37,
+            expected_message_bytes_len: 35,
         },
     ];
 
@@ -459,8 +459,8 @@ fn array_patch_fixture_bytes_are_cross_language_compatible() {
         },
     ]);
     let expected_bytes = vec![
-        217, 255, 1, 130, 129, 128, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131, 9, 128,
-        130, 131, 2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
+        217, 255, 1, 129, 130, 130, 0, 132, 97, 97, 97, 98, 97, 99, 97, 100, 131, 9, 128, 130, 131,
+        2, 1, 129, 97, 67, 131, 0, 0, 129, 97, 65,
     ];
     let mut encode_pool = ProducerPathSegmentPool::new();
     let bytes = encode_message(&mut encode_pool, &message);
@@ -621,8 +621,8 @@ fn producer_replaces_completely_different_large_strings() {
     assert_eq!(
         decoded,
         Message::new(vec![Action::Replace {
-            path: vec![key("text")],
-            value: json!(new),
+            path: vec![],
+            value: json!({"text": new}),
         }])
     );
 }
