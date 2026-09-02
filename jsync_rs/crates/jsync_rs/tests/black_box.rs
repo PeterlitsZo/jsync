@@ -1,4 +1,4 @@
-use jsync::{
+use jsync_rs::{
     Action, ArrayPatchEdit, Consumer, Message, PathSegment, Producer, ProducerPathSegmentPool,
     StringPatchEdit,
 };

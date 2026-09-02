@@ -1,9 +1,33 @@
 {
-  "name": "jsync",
+  "name": "jsync_js",
   "version": "0.1.0",
-  "private": true,
+  "description": "Synchronize JSON documents between producers and consumers with CBOR messages.",
+  "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeterlitsZo/jsync.git",
+    "directory": "jsync_js/packages/jsync"
+  },
+  "homepage": "https://github.com/PeterlitsZo/jsync#readme",
+  "bugs": {
+    "url": "https://github.com/PeterlitsZo/jsync/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "sideEffects": false,
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "tsx --test",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },

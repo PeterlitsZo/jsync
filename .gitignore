@@ -8,3 +8,7 @@ jsync_rs/target/
 
 # JavaScript dependencies
 jsync_js/**/node_modules/
+
+# JavaScript build artifacts
+jsync_js/packages/jsync/dist/
+jsync_js/packages/jsync/*.tgz

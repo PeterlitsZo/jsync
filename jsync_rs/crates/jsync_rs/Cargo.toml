@@ -1,0 +1,16 @@
+[package]
+name = "jsync_rs"
+version.workspace = true
+edition.workspace = true
+description = "Synchronize JSON documents between producers and consumers with CBOR messages."
+license = "MIT"
+repository = "https://github.com/PeterlitsZo/jsync"
+readme = "../../../README.md"
+rust-version = "1.85"
+keywords = ["json", "sync", "cbor"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.8.7"
+ciborium = "0.2.2"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
